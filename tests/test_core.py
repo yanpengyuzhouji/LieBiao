@@ -6,12 +6,23 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from backend.adapters import BaseAdapter, CsgAdapter, PageParser, SgccPortalAdapter, clean_text, extract_external_id, first_date
+from backend.adapters import BaseAdapter, CdtAdapter, ChngAdapter, CsgAdapter, EpecAdapter, PageParser, SgccPortalAdapter, clean_text, extract_external_id, first_date
 from backend.matching import match_sources
 from backend.parsers import parse_document, safe_extract_zip
 
 
 class AdapterParsingTests(unittest.TestCase):
+    class JsonResponse:
+        def __init__(self, payload: dict) -> None:
+            self.payload = payload
+            self.text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self.payload
+
     def test_hash_route_external_ids(self) -> None:
         self.assertEqual(
             extract_external_id("https://ecp.sgcc.com.cn/ecp2.0/portal/#/doc/doci-bid/2609030023176732_2018032900295987"),
@@ -101,6 +112,46 @@ class AdapterParsingTests(unittest.TestCase):
         self.assertEqual([item.external_id for item in result], ["201", "202"])
         self.assertEqual([item.detail_id for item in result], ["detail-201", "detail-202"])
         self.assertIn("/detail-201_2018032700291334", result[0].url)
+
+    def test_epec_list_uses_noticefile_detail(self) -> None:
+        class Client:
+            def post(inner_self, _url: str, json: dict, headers: dict) -> AdapterParsingTests.JsonResponse:
+                del headers
+                self.assertEqual(json["start"], 0)
+                return self.JsonResponse({"status": True, "data": {"root": [{
+                    "noticeId": "9001", "noticeTitle": "变压器招标公告", "noticeTypeName": "招标公告",
+                    "releaseTime": "2026-09-08 10:00:00", "bidOpeningTime": "2026-09-18 09:00:00",
+                    "businessId": "biz-1", "noticeType": "01", "attachUrl": "static/2026_9/a.txt",
+                }], "totalCount": 1}})
+
+        adapter = EpecAdapter.__new__(EpecAdapter)
+        adapter.base_url = "https://bidding.epec.com/"
+        adapter.client = Client()
+        rows = adapter.list_notices()
+        self.assertEqual(rows[0].external_id, "9001")
+        self.assertIn("noticeId=9001", rows[0].url)
+        self.assertEqual(rows[0].detail_id, "static/2026_9/a.txt")
+
+    def test_cdt_list_uses_public_message_type_zero(self) -> None:
+        class Client:
+            def post(inner_self, _url: str, data: dict, headers: dict) -> AdapterParsingTests.JsonResponse:
+                del headers
+                self.assertEqual(data["messagetype"], "0")
+                return self.JsonResponse({"data": [{"id": "1881919", "message_title": "风机采购公告", "publish_time": "2026-09-04 19:53:20"}], "count": 1})
+
+        adapter = CdtAdapter.__new__(CdtAdapter)
+        adapter.base_url = "https://tang.cdt-ec.com/"
+        adapter.client = Client()
+        rows = adapter.list_notices()
+        self.assertEqual(rows[0].external_id, "1881919")
+        self.assertTrue(rows[0].url.endswith("moreall?id=1881919"))
+
+    def test_chng_rewrites_hash_detail_to_public_html(self) -> None:
+        adapter = ChngAdapter.__new__(ChngAdapter)
+        self.assertEqual(
+            adapter.public_detail_url("https://ec.chng.com.cn/channel/home/#/detail?id=12861658"),
+            "https://ec.chng.com.cn/ecmall/announcement/announcementDetailTender.do?announcementId=12861658",
+        )
 
 
 class WorkbookCompatibilityTests(unittest.TestCase):

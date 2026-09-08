@@ -355,6 +355,9 @@ def seed_base_data(connection: sqlite3.Connection) -> None:
         ("csg", "南方电网", "https://www.bidding.csg.cn/", "csg", "public"),
         ("ecp", "ECP2.0", "https://ecp.sgcc.com.cn/ecp2.0/portal/#/", "ecp", "public_or_session"),
         ("sgcc", "国网交易专区", "https://sgccetp.com.cn/portal/#/", "sgcc", "public_or_session"),
+        ("epec", "中国石化物资", "https://bidding.epec.com/tenderInfoOne?key=1", "epec", "public"),
+        ("chng", "中国华能", "https://ec.chng.com.cn/channel/home/#/purchase?top=0", "chng", "public"),
+        ("cdt", "大唐集团", "https://tang.cdt-ec.com/notice/moreController/toMore?globleType=0", "cdt", "public"),
     ]
     for code, name, url, adapter, public_mode in sites:
         connection.execute(

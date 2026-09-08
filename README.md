@@ -30,7 +30,7 @@ Windows 上建议使用 `py run_app.py` 启动。打包时在 Windows 开发机�
 - `app.js`：视图渲染、筛选、抽屉、导入和标记交互；后端不可用时保留演示数据
 - `backend/main.py`：FastAPI API、静态页面托管和 Windows 单机入口
 - `backend/db.py`：SQLite 表结构、索引和基础平台/关键词/任务初始化
-- `backend/adapters.py`：三个平台统一适配器；包含公开列表、详情、附件和健康检查
+- `backend/adapters.py`：平台统一适配器；包含公开列表、详情、附件和健康检查
 - `backend/service.py`：公告入库、版本、字段抽取、关键词证据、附件下载和任务运行
 - `backend/parsers.py`：PDF、DOCX、XLSX、文本/HTML 解析与 ZIP 安全解压
 - `backend/storage.py`：数据目录和文件路径安全控制
@@ -40,7 +40,7 @@ Windows 上建议使用 `py run_app.py` 启动。打包时在 Windows 开发机�
 
 后端已经提供 `/api/notices`、`/api/notices/{id}`、`/api/notices/{id}/hits`、`/api/notices/{id}/files`、`/api/crawl-jobs`、`/api/imports/url`、`/api/imports/excel`、`/api/imports/file` 和 `/api/settings/storage` 等接口。
 
-三个平台已接入真实公开列表和详情采集；ECP2.0 与国网交易专区的公告 ZIP 可公开下载。验证方法：
+已接入南方电网、ECP2.0、国网交易专区、中国石化物资、中国华能和大唐集团。中国石化支持公开列表与正文采集；华能支持公开详情解析；华能、大唐列表若触发平台安全验证会明确失败，不会把验证页误入库。验证方法：
 
 ```bash
 python -m unittest discover -s tests -v

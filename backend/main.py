@@ -32,7 +32,7 @@ from .maintenance import activity
 from .migration import adopt_storage, migrate_storage
 
 
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.1.0"
 app = FastAPI(title="猎标 V1 API", version=APP_VERSION, docs_url="/api/docs", redoc_url=None)
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 

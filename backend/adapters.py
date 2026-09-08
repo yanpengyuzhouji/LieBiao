@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import getproxies
 
 import httpx
@@ -446,7 +446,190 @@ class EcpAdapter(SgccPortalAdapter):
     portal_root = "https://ecp.sgcc.com.cn/ecp2.0/portal/"
 
 
-ADAPTERS = {"csg": CsgAdapter, "ecp": EcpAdapter, "sgcc": SgccPortalAdapter}
+class EpecAdapter(BaseAdapter):
+    code = "epec"
+    api_url = "https://bidding.epec.com/gateway/obs/business/ubm/notice/queryNoticePageList"
+
+    def list_notices(self, max_pages: int = 1, max_notices: int = 100, list_url: str | None = None, exclude_external_ids: set[str] | None = None) -> list[NoticeSummary]:
+        del list_url
+        result: list[NoticeSummary] = []
+        excluded = exclude_external_ids or set()
+        page_size = min(50, max_notices)
+        for page in range(max_pages):
+            request = {"model": {"noticeTypeList": ["01", "11"]}, "start": page * page_size, "limit": page_size}
+            try:
+                response = self.client.post(self.api_url, json=request, headers={"Content-Type": "application/json", "Referer": self.base_url})
+                response.raise_for_status()
+                payload = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                raise AdapterError(f"中国石化公告列表访问失败：{exc}") from exc
+            rows = ((payload.get("data") or {}).get("root") or []) if payload.get("status") else []
+            for row in rows:
+                notice_id = str(row.get("noticeId") or "")
+                title = str(row.get("noticeTitle") or "").strip()
+                if not notice_id or not title or notice_id in excluded:
+                    continue
+                query = urlencode({
+                    "noticeId": notice_id, "type": row.get("noticeType") or "01",
+                    "businessId": row.get("businessId") or "", "attachUrl": row.get("attachUrl") or "",
+                })
+                result.append(NoticeSummary(
+                    external_id=notice_id, title=title,
+                    url=f"https://bidding.epec.com/noticeDetail?{query}",
+                    published_at=row.get("releaseTime"), notice_type=row.get("noticeTypeName") or "招标公告",
+                    detail_id=row.get("attachUrl") or None,
+                ))
+                if len(result) >= max_notices:
+                    return result
+            if len(rows) < page_size:
+                break
+        if not result:
+            raise AdapterError("中国石化公开公告列表未返回可识别数据")
+        return result
+
+    def fetch_notice(self, url: str, external_id: str | None = None, detail_id: str | None = None) -> NoticeData:
+        query = parse_qs(urlparse(url).query)
+        notice_id = external_id or (query.get("noticeId") or [""])[0] or extract_external_id(url)
+        attach_path = detail_id or (query.get("attachUrl") or [""])[0]
+        if not attach_path:
+            raise AdapterError("中国石化公告缺少正文地址")
+        text_url = urljoin("https://bidding.epec.com/noticefile/", attach_path.lstrip("/"))
+        try:
+            response = self.client.get(text_url, headers={"Referer": url})
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise AdapterError(f"中国石化公告正文访问失败：{exc}") from exc
+        raw_html = response.content.decode("utf-8", errors="replace")
+        if raw_html.count("�") > 5:
+            raw_html = response.content.decode("gb18030", errors="replace")
+        parser = PageParser()
+        parser.feed(raw_html)
+        body = clean_text(parser.text_parts)
+        title = clean_text(parser.heading_parts).strip() or body.split("\n", 1)[0] or str(notice_id)
+        return NoticeData(
+            external_id=str(notice_id), title=title, url=url, body_text=body, raw_html=raw_html,
+            published_at=first_date(body, ("发布时间", "发布日期")),
+            opening_at=first_date(body, ("开标时间", "投标截止时间", "递交截止时间")),
+            notice_type="招标公告", attachments=self._attachments_from_links(parser.links, text_url),
+        )
+
+
+class ChngAdapter(BaseAdapter):
+    code = "chng"
+    legacy_root = "https://ec.chng.com.cn/ecmall/"
+
+    def health_check(self) -> dict[str, Any]:
+        try:
+            self.list_notices(max_pages=1, max_notices=1)
+            return {"ok": True, "status_code": 200, "message": "公开公告列表正常"}
+        except (AdapterError, httpx.HTTPError) as exc:
+            return {"ok": False, "status_code": None, "message": str(exc)}
+
+    @staticmethod
+    def public_detail_url(url: str) -> str:
+        query = parse_qs(urlparse(url).query)
+        if not query and "?" in urlparse(url).fragment:
+            query = parse_qs(urlparse(url).fragment.split("?", 1)[1])
+        notice_id = (query.get("id") or query.get("announcementId") or [""])[0]
+        return f"https://ec.chng.com.cn/ecmall/announcement/announcementDetailTender.do?announcementId={notice_id}" if notice_id else url
+
+    def list_notices(self, max_pages: int = 1, max_notices: int = 100, list_url: str | None = None, exclude_external_ids: set[str] | None = None) -> list[NoticeSummary]:
+        entry = list_url or f"{self.legacy_root}more.do?type=101"
+        result: list[NoticeSummary] = []
+        excluded = exclude_external_ids or set()
+        for page in range(1, max_pages + 1):
+            separator = "&" if "?" in entry else "?"
+            response = self.client.get(f"{entry}{separator}page={page}")
+            if response.status_code == 412:
+                raise AdapterError("中国华能列表触发平台安全验证，未将验证页作为公告入库")
+            response.raise_for_status()
+            parser = PageParser()
+            parser.feed(response.text)
+            found = 0
+            for href, label in parser.links:
+                match = re.search(r"announcementDetailTender\.do\?announcementId=(\d+)", href or "")
+                if not match or not label.strip():
+                    continue
+                found += 1
+                notice_id = match.group(1)
+                if notice_id in excluded:
+                    continue
+                result.append(NoticeSummary(notice_id, label.strip(), urljoin(entry, href)))
+                if len(result) >= max_notices:
+                    return result
+            if not found:
+                break
+        if not result:
+            raise AdapterError("中国华能公开公告列表未返回可识别数据")
+        return result
+
+    def fetch_notice(self, url: str, external_id: str | None = None, detail_id: str | None = None) -> NoticeData:
+        del detail_id
+        public_url = self.public_detail_url(url)
+        notice = super().fetch_notice(public_url, external_id=external_id)
+        title_match = re.search(r"详情页\s*\n\s*(.+?)\s*\n\s*来源[：:]", notice.body_text)
+        if title_match:
+            notice.title = title_match.group(1).strip()
+            if "中标" in notice.title:
+                notice.notice_type = "中标公示"
+            elif "采购" in notice.title:
+                notice.notice_type = "采购公告"
+        notice.url = url
+        return notice
+
+
+class CdtAdapter(BaseAdapter):
+    code = "cdt"
+    list_api = "https://tang.cdt-ec.com/notice/moreController/getList"
+
+    def health_check(self) -> dict[str, Any]:
+        try:
+            self.list_notices(max_pages=1, max_notices=1)
+            return {"ok": True, "status_code": 200, "message": "公开公告列表正常"}
+        except (AdapterError, httpx.HTTPError) as exc:
+            return {"ok": False, "status_code": None, "message": str(exc)}
+
+    def list_notices(self, max_pages: int = 1, max_notices: int = 100, list_url: str | None = None, exclude_external_ids: set[str] | None = None) -> list[NoticeSummary]:
+        del list_url
+        result: list[NoticeSummary] = []
+        excluded = exclude_external_ids or set()
+        page_size = min(50, max_notices)
+        for page in range(1, max_pages + 1):
+            data = {"page": page, "limit": page_size, "messagetype": "0", "startDate": "", "endDate": ""}
+            try:
+                response = self.client.post(self.list_api, data=data, headers={"Referer": self.base_url})
+                response.raise_for_status()
+                if response.text.lstrip().startswith("<"):
+                    raise AdapterError("大唐集团列表触发平台安全验证，未将验证页作为公告入库")
+                payload = response.json()
+            except AdapterError:
+                raise
+            except (httpx.HTTPError, ValueError) as exc:
+                raise AdapterError(f"大唐集团公告列表访问失败：{exc}") from exc
+            rows = payload.get("data") or []
+            for row in rows:
+                notice_id = str(row.get("id") or "")
+                title = str(row.get("message_title") or "").strip()
+                if not notice_id or not title or notice_id in excluded:
+                    continue
+                result.append(NoticeSummary(
+                    notice_id, title,
+                    f"https://tang.cdt-ec.com/notice/moreController/moreall?id={notice_id}",
+                    row.get("publish_time"), "招标公告",
+                ))
+                if len(result) >= max_notices:
+                    return result
+            if len(rows) < page_size:
+                break
+        if not result:
+            raise AdapterError("大唐集团公开公告列表未返回可识别数据")
+        return result
+
+
+ADAPTERS = {
+    "csg": CsgAdapter, "ecp": EcpAdapter, "sgcc": SgccPortalAdapter,
+    "epec": EpecAdapter, "chng": ChngAdapter, "cdt": CdtAdapter,
+}
 
 
 def make_adapter(code: str, base_url: str, session_cookie: str | None = None) -> BaseAdapter:

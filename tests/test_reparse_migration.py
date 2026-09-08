@@ -7,7 +7,7 @@ from backend.db import get_db, init_db
 from backend.adapters import NoticeData
 from backend.service import ingest_notice_data, create_attachment, process_local_attachment
 from backend.parsers import DocumentResult
-from backend.migration import migrate_storage
+from backend.migration import adopt_storage, migrate_storage
 from backend.maintenance import activity
 from backend import reparse_tasks
 
@@ -81,3 +81,18 @@ class ReparseMigrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             migrate_storage(target)
         self.assertEqual(existing.read_text(encoding='utf-8'),'keep')
+
+    def test_existing_liebiao_database_can_be_adopted_without_overwrite(self):
+        source = settings.data_dir
+        target = self.root / 'existing-liebiao'
+        settings.data_dir = target
+        init_db()
+        with get_db() as c:
+            target_notice = ingest_notice_data(c, None, NoticeData('existing', '已有公告', 'manual://existing', '正文'), source_type='file_import', download_attachments=False)
+        settings.data_dir = source
+
+        adopt_storage(target)
+
+        self.assertEqual(settings.data_dir, target.resolve())
+        with get_db() as c:
+            self.assertIsNotNone(c.execute('SELECT id FROM notices WHERE id=?', (target_notice,)).fetchone())

@@ -29,10 +29,10 @@ from .storage import absolute_from_relative, attachment_directory, relative_to_d
 from .stabilization_migration import migrate_stabilization_schema
 from . import reparse_tasks
 from .maintenance import activity
-from .migration import migrate_storage
+from .migration import adopt_storage, migrate_storage
 
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 app = FastAPI(title="猎标 V1 API", version=APP_VERSION, docs_url="/api/docs", redoc_url=None)
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 
@@ -228,14 +228,30 @@ def update_storage_settings(payload: StorageRequest) -> dict[str, Any]:
                 raise HTTPException(status_code=500, detail="当前数据库不存在，无法迁移目录")
             target_has_data = root.exists() and any(root.iterdir())
             if target_has_data:
-                raise HTTPException(status_code=400, detail="请选择空目录，迁移不会覆盖已有数据；原目录会保留")
+                if not (root / "scout.db").is_file():
+                    raise HTTPException(status_code=400, detail="目标目录非空且不是已有猎标数据目录")
+                if not payload.overwrite:
+                    raise HTTPException(status_code=409, detail="检测到已有猎标数据库。切换后不会覆盖其内容，是否确认使用该目录？")
+                scheduler.stop()
+                try:
+                    moved_from = adopt_storage(root)
+                    init_db()
+                    migrate_stabilization_schema()
+                    reparse_tasks.initialize(recover=True)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                finally:
+                    scheduler.start()
             backup_db = None
-            try:
-                moved_from = migrate_storage(root)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except RuntimeError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if not (root / "scout.db").is_file():
+                try:
+                    moved_from = migrate_storage(root)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
         else:
             settings.persist_data_dir()
     settings.ensure_dirs()

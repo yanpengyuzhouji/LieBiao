@@ -91,16 +91,11 @@ def main():
         if not mutex:
             raise OSError('无法创建应用实例锁')
         if ctypes.get_last_error() == 183:
-            state = config_dir/'desktop-state.json'
-            if state.exists() and not args.no_browser:
-                port = json.loads(state.read_text(encoding='utf-8'))['port']
-                if health(port): webbrowser.open(f'http://127.0.0.1:{port}')
             return
     port = args.port
     for candidate in range(args.port,args.port+20):
         existing=health(candidate)
         if existing and Path(existing.get('storage_root','')).resolve() == settings.data_dir.resolve():
-            if not args.no_browser: webbrowser.open(f'http://127.0.0.1:{candidate}')
             return
         with socket.socket() as probe:
             try: probe.bind(('127.0.0.1',candidate))
@@ -134,7 +129,7 @@ def main():
         elif time.monotonic()>deadline or not worker.is_alive():
             label.set('启动失败，请查看配置目录中的 desktop.log')
         else: window.after(300,ready)
-    def close():
+    def exit_app():
         if not messagebox.askyesno('退出系统','退出后将停止定时采集。确认退出吗？'): return
         server.should_exit=True
         label.set('正在等待当前请求结束…')
@@ -142,7 +137,8 @@ def main():
             if worker.is_alive(): window.after(300,stopped)
             else: window.destroy()
         stopped()
-    window.protocol('WM_DELETE_WINDOW',close)
+    tk.Button(window,text='退出系统',command=exit_app).pack(pady=2)
+    window.protocol('WM_DELETE_WINDOW',window.iconify)
     window.after(300,ready);window.mainloop()
 
 

@@ -609,7 +609,7 @@ async function saveStorageConfig() {
   try {
     await request(false);
   } catch (error) {
-    if (error.status !== 409 || !window.confirm(error.message + '\n是否将当前数据库和文件迁移到该目录？目标数据库会自动保留备份。')) throw error;
+    if (error.status !== 409 || !window.confirm(error.message)) throw error;
     await request(true);
   }
   showToast('本地文件目录配置已保存');

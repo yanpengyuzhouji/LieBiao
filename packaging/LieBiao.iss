@@ -1,4 +1,4 @@
-#define AppVersion "1.0.2"
+#define AppVersion "1.0.3"
 [Setup]
 AppId={{B7DF54C2-A232-4BF0-82E4-42BDCAD2973F}
 AppName=猎标招标公告采集系统
@@ -37,6 +37,16 @@ Filename: "{app}\LieBiao.exe"; Description: "启动猎标"; Flags: nowait postin
 var
   DataPage: TInputDirWizardPage;
 
+function StorageConfigPath: String;
+begin
+  Result := ExpandConstant('{param:CONFIG_DIR|{localappdata}\LieBiaoDesktop}\storage.json');
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (PageID = DataPage.ID) and FileExists(StorageConfigPath);
+end;
+
 procedure InitializeWizard;
 begin
   DataPage := CreateInputDirPage(wpSelectDir, '选择数据存放位置',
@@ -62,7 +72,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ExitCode: Integer;
 begin
-  if CurStep = ssPostInstall then begin
+  if (CurStep = ssPostInstall) and not FileExists(StorageConfigPath) then begin
     if not Exec(ExpandConstant('{app}\LieBiao.exe'),
       '--configure-data "' + DataPage.Values[0] + '" --config-dir "' + ExpandConstant('{param:CONFIG_DIR|{localappdata}\LieBiaoDesktop}') + '"', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
       RaiseException('数据目录配置失败。请确认目录可写且数据库有效。下次启动可重新选择目录。');

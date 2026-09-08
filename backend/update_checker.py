@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 from urllib.parse import urlparse
 
 import httpx
@@ -24,23 +25,30 @@ def check_update(current_version: str, manifest_url: str) -> dict:
     if urlparse(manifest_url).scheme != "https":
         raise UpdateCheckError("更新地址必须使用 HTTPS")
     try:
-        response = httpx.get(
+        with httpx.stream(
+            "GET",
             manifest_url,
             headers={"Accept": "application/vnd.github+json, application/json", "User-Agent": "LieBiao-Update-Checker"},
             follow_redirects=True,
             timeout=5.0,
-        )
-        response.raise_for_status()
+        ) as response:
+            response.raise_for_status()
+            declared_size = int(response.headers.get("Content-Length", "0") or 0)
+            if declared_size > 1024 * 1024:
+                raise UpdateCheckError("更新清单超过 1 MB 限制")
+            content = bytearray()
+            for chunk in response.iter_bytes():
+                content.extend(chunk)
+                if len(content) > 1024 * 1024:
+                    raise UpdateCheckError("更新清单超过 1 MB 限制")
     except httpx.HTTPError as exc:
-        raise UpdateCheckError(f"无法访问更新源：{exc}") from exc
-    if len(response.content) > 1024 * 1024:
-        raise UpdateCheckError("更新清单超过 1 MB 限制")
+        raise UpdateCheckError("无法访问更新源") from exc
     try:
-        payload = response.json()
-    except ValueError as exc:
+        payload = json.loads(content)
+    except (ValueError, UnicodeDecodeError) as exc:
         raise UpdateCheckError("更新源没有返回有效 JSON") from exc
     latest = str(payload.get("tag_name") or payload.get("version") or "").lstrip("vV")
-    release_url = str(payload.get("html_url") or payload.get("url") or "").strip()
+    release_url = str(payload.get("html_url") or payload.get("release_url") or payload.get("download_url") or "").strip()
     if urlparse(release_url).scheme != "https":
         raise UpdateCheckError("更新下载页必须使用 HTTPS")
     available = version_key(latest) > version_key(current_version)

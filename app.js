@@ -8,6 +8,7 @@ const appState = {
 
 let backendOnline = false;
 let searchTimer = null;
+let updateInfo = null;
 const activeRunWatchers = new Set();
 const activeReparseWatchers = new Set();
 
@@ -46,6 +47,22 @@ async function apiFetch(path, options) {
     const error = new Error(message); error.status = response.status; throw error;
   }
   return response.json();
+}
+
+async function checkForUpdates() {
+  if (!backendOnline) return;
+  try {
+    const result = await apiFetch('/api/update/check');
+    if (!result.available) return;
+    updateInfo = result;
+    const button = $('.notification-button');
+    if (button) {
+      button.title = `发现新版本 ${result.latest_version}`;
+      button.setAttribute('aria-label', `发现新版本 ${result.latest_version}`);
+      button.classList.add('has-update');
+    }
+    showToast(`发现新版本 ${result.latest_version}，点击右上角通知按钮查看`);
+  } catch (_) { /* 更新检查失败不影响本地功能 */ }
 }
 
 function normalizeBackendNotice(item) {
@@ -617,6 +634,11 @@ async function saveStorageConfig() {
 
 
 document.addEventListener('click', event => {
+  if (event.target.closest('.notification-button')) {
+    if (!updateInfo) { showToast('当前没有新版本通知'); return; }
+    if (window.confirm(`发现新版本 ${updateInfo.latest_version}，是否打开官方下载页？`)) window.open(updateInfo.release_url, '_blank', 'noopener');
+    return;
+  }
   const nav = event.target.closest('[data-view]');
   if (nav) { setView(nav.dataset.view); return; }
   const viewLink = event.target.closest('[data-view-link]');
@@ -708,5 +730,5 @@ document.addEventListener('submit', event => { if (event.target.id === 'config-f
 document.addEventListener('keydown', event => { if (event.key === 'Escape') { closeDetail(); closeImport(); closeConfig(); } });
 
 renderCurrentView();
-loadBackendNotices();
+loadBackendNotices().then(checkForUpdates);
 loadManagementData();

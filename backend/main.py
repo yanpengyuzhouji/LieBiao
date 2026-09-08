@@ -30,6 +30,7 @@ from .stabilization_migration import migrate_stabilization_schema
 from . import reparse_tasks
 from .maintenance import activity
 from .migration import adopt_storage, migrate_storage
+from .update_checker import UpdateCheckError, check_update
 
 
 APP_VERSION = "1.1.0"
@@ -188,6 +189,16 @@ def get_storage_settings() -> dict[str, Any]:
 @app.get('/api/settings/parsers')
 def get_parser_capabilities():
     return parser_capabilities()
+
+
+@app.get("/api/update/check")
+def get_update_status() -> dict[str, Any]:
+    if not settings.update_enabled:
+        return {"enabled": False, "available": False, "current_version": APP_VERSION}
+    try:
+        return {"enabled": True, **check_update(APP_VERSION, settings.update_url)}
+    except UpdateCheckError as exc:
+        return {"enabled": True, "available": False, "current_version": APP_VERSION, "error": str(exc)}
 
 
 def _copy_storage_tree(source: Path, target: Path) -> None:

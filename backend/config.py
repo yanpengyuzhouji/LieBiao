@@ -8,6 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def default_config_dir() -> Path:
     configured = os.getenv('LIEBIAO_CONFIG_DIR')
     if configured:
@@ -64,6 +72,16 @@ class Settings:
     max_expanded_mb: int = int(os.getenv("LIEBIAO_MAX_EXPANDED_MB", "2048"))
     max_archive_files: int = int(os.getenv("LIEBIAO_MAX_ARCHIVE_FILES", "3000"))
     max_archive_depth: int = int(os.getenv("LIEBIAO_MAX_ARCHIVE_DEPTH", "3"))
+    update_enabled: bool = env_flag("LIEBIAO_UPDATE_ENABLED", True)
+    update_url: str = os.getenv(
+        "LIEBIAO_UPDATE_URL",
+        "https://api.github.com/repos/yanpengyuzhouji/LieBiao/releases/latest",
+    ).strip()
+    update_enabled: bool = env_flag("LIEBIAO_UPDATE_ENABLED", True)
+    update_url: str = os.getenv(
+        "LIEBIAO_UPDATE_URL",
+        "https://api.github.com/repos/yanpengyuzhouji/LieBiao/releases/latest",
+    ).strip()
 
     @property
     def config_path(self) -> Path:

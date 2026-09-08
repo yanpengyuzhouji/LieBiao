@@ -9,6 +9,7 @@ const appState = {
 let backendOnline = false;
 let searchTimer = null;
 let updateInfo = null;
+const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 const activeRunWatchers = new Set();
 const activeReparseWatchers = new Set();
 
@@ -54,6 +55,7 @@ async function checkForUpdates() {
   try {
     const result = await apiFetch('/api/update/check');
     if (!result.available) return;
+    const alreadyNotified = updateInfo && updateInfo.latest_version === result.latest_version;
     updateInfo = result;
     const button = $('.notification-button');
     if (button) {
@@ -61,7 +63,7 @@ async function checkForUpdates() {
       button.setAttribute('aria-label', `发现新版本 ${result.latest_version}`);
       button.classList.add('has-update');
     }
-    showToast(`发现新版本 ${result.latest_version}，点击右上角通知按钮查看`);
+    if (!alreadyNotified) showToast(`发现新版本 ${result.latest_version}，点击右上角通知按钮查看`);
   } catch (_) { /* 更新检查失败不影响本地功能 */ }
 }
 
@@ -636,7 +638,7 @@ async function saveStorageConfig() {
 document.addEventListener('click', event => {
   if (event.target.closest('.notification-button')) {
     if (!updateInfo) { showToast('当前没有新版本通知'); return; }
-    if (window.confirm(`发现新版本 ${updateInfo.latest_version}，是否打开官方下载页？`)) window.open(updateInfo.release_url, '_blank', 'noopener');
+    window.open(updateInfo.release_url, '_blank', 'noopener');
     return;
   }
   const nav = event.target.closest('[data-view]');
@@ -735,4 +737,5 @@ document.addEventListener('keydown', event => { if (event.key === 'Escape') { cl
 
 renderCurrentView();
 loadBackendNotices().then(checkForUpdates);
+setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL_MS);
 loadManagementData();

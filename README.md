@@ -19,7 +19,7 @@ Windows 上建议使用 `py run_app.py` 启动。打包时在 Windows 开发机�
 
 旧版 `.doc` 解析依赖目标电脑安装 Microsoft Word；`.docx`、`.xlsx` 和文本型 PDF 的解析组件已随程序打包。
 
-程序启动后会通过 GitHub Releases 公开接口检查新版本；检查失败不影响采集。可通过 `LIEBIAO_UPDATE_ENABLED=false` 关闭，或用 `LIEBIAO_UPDATE_URL` 指向其他 HTTPS JSON 更新清单。发布新版本时需在 GitHub 创建对应 Release（例如 `v1.1.0`）并上传安装包。
+程序启动后会通过 GitHub Releases 公开接口检查一次新版本，运行期间每小时静默检查；检查失败不提示且不影响采集。同一新版本只提示一次，点击右上角通知按钮可打开下载页。可通过 `LIEBIAO_UPDATE_ENABLED=false` 关闭，或用 `LIEBIAO_UPDATE_URL` 指向其他 HTTPS JSON 更新清单。发布新版本时需在 GitHub 创建对应 Release（例如 `v1.1.0`）并上传安装包。
 
 ### 采集范围约束
 

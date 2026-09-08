@@ -113,12 +113,19 @@ class StabilityIntegrationTests(unittest.TestCase):
             parsed_id = ingest_notice_data(connection, 1, NoticeData("hidden-1", "完整未命中公告", "https://example.com/hidden-1", "普通正文"), source_type="crawl", download_attachments=False)
             issue_id = ingest_notice_data(connection, 1, NoticeData("hidden-2", "异常未命中公告", "https://example.com/hidden-2", "普通正文"), source_type="crawl", download_attachments=False)
             create_attachment(connection, issue_id, "待解析附件.doc", "https://example.com/pending.doc")
+            visible_id = ingest_notice_data(connection, 1, NoticeData("visible-1", "人工公告", "https://example.com/visible-1", "普通正文"), source_type="file_import", download_attachments=False)
+            connection.execute("UPDATE notices SET business_mark='focus' WHERE id=?", (visible_id,))
         self.assertEqual(list_notices(q="未命中", limit=10, offset=0)["total"], 0)
+        normal_counts = list_notices(limit=10, offset=0)["category_counts"]
         recovered = list_notices(q="未命中", only_matched=False, only_unmatched=True, limit=10, offset=0)
         self.assertEqual(recovered["total"], 1)
         self.assertEqual(recovered["category_counts"]["unmatched"], 1)
         self.assertEqual(recovered["items"][0]["id"], str(issue_id))
         self.assertNotEqual(recovered["items"][0]["id"], str(parsed_id))
+        unsearched_recovery = list_notices(only_matched=False, only_unmatched=True, limit=10, offset=0)
+        self.assertEqual(unsearched_recovery["category_counts"]["all"], normal_counts["all"])
+        self.assertEqual(unsearched_recovery["category_counts"]["pending"], normal_counts["pending"])
+        self.assertEqual(unsearched_recovery["category_counts"]["focus"], normal_counts["focus"])
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ from .maintenance import activity
 from .migration import adopt_storage, migrate_storage
 
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 app = FastAPI(title="猎标 V1 API", version=APP_VERSION, docs_url="/api/docs", redoc_url=None)
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 
@@ -583,10 +583,10 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
         clauses.append(possible_missed_match)
     elif only_matched:
         clauses.append("(n.source_type<>'crawl' OR EXISTS (SELECT 1 FROM keyword_hits mh WHERE mh.notice_id=n.id AND mh.is_negative=0))")
-    # Category totals use the same search/platform/attachment scope, but are
-    # independent from the currently selected category.
-    facet_clauses = list(clauses)
-    facet_params = list(params)
+    # Business-category totals stay on the normal notice-library scope even
+    # while the separate possible-missed-match recovery view is selected.
+    facet_clauses = scope_clauses + ["(n.source_type<>'crawl' OR EXISTS (SELECT 1 FROM keyword_hits fh WHERE fh.notice_id=n.id AND fh.is_negative=0))"]
+    facet_params = scope_params
     if mark != "all":
         clauses.append("n.business_mark=?"); params.append(mark)
     if status != "all":

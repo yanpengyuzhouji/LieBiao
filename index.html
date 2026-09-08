@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101c36" />
+    <title>猎标 · 招标信息采集管理系统</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark"><span></span><span></span><span></span></div>
+          <div>
+            <div class="brand-name">猎标 <em>SCOUT</em></div>
+            <div class="brand-caption">招标信息采集管理系统</div>
+          </div>
+        </div>
+
+        <div class="workspace-switcher">
+          <div class="workspace-icon">商</div>
+          <div class="workspace-copy">
+            <strong>商务中心</strong>
+            <span>内部工作区</span>
+          </div>
+          <span class="chevron">⌄</span>
+        </div>
+
+        <div class="nav-label">工作台</div>
+        <nav class="main-nav" aria-label="主导航">
+          <button class="nav-item" data-view="overview"><span class="nav-icon">⌂</span><span>采集总览</span></button>
+          <button class="nav-item active" data-view="notices"><span class="nav-icon">▤</span><span>公告库</span><b class="nav-count" id="notice-nav-count">0</b></button>
+          <button class="nav-item" data-view="keywords"><span class="nav-icon">⌕</span><span>关键词组</span></button>
+          <button class="nav-item" data-view="jobs"><span class="nav-icon">◷</span><span>采集任务</span><b class="status-dot"></b></button>
+        </nav>
+
+        <div class="nav-label nav-label-spaced">系统配置</div>
+        <nav class="main-nav" aria-label="系统配置">
+          <button class="nav-item" data-view="platforms"><span class="nav-icon">◎</span><span>平台与账号</span></button>
+          <button class="nav-item" data-view="imports"><span class="nav-icon">⇧</span><span>导入中心</span></button>
+          <button class="nav-item" data-view="logs"><span class="nav-icon">≡</span><span>系统日志</span></button>
+        </nav>
+
+        <div class="sidebar-spacer"></div>
+        <div class="sidebar-health">
+          <div class="health-pulse"><span></span></div>
+          <div><strong>采集服务正常</strong><small>上次检查 · 2 分钟前</small></div>
+          <span class="health-more">···</span>
+        </div>
+        <div class="sidebar-user">
+          <div class="avatar avatar-blue">林</div>
+          <div class="user-copy"><strong>林晓彤</strong><span>商务专员</span></div>
+          <button class="more-button" aria-label="更多">···</button>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>工作台</span><i>/</i><strong id="breadcrumb-current">公告库</strong></div>
+          <div class="topbar-actions">
+            <button class="icon-button notification-button" aria-label="通知"><span class="bell-icon">♧</span><i></i></button>
+            <div class="topbar-divider"></div>
+            <button class="user-menu"><span class="avatar avatar-blue avatar-small">林</span><span>林晓彤</span><span class="chevron">⌄</span></button>
+          </div>
+        </header>
+
+        <section class="page-body" id="page-body">
+          <div class="page-heading">
+            <div>
+              <div class="eyebrow"><span class="eyebrow-line"></span>实时采集工作台</div>
+              <h1 id="page-title">公告库</h1>
+              <p id="page-subtitle">汇总三个平台的最新招标信息，快速确认与跟进。</p>
+            </div>
+            <div class="heading-actions">
+              <span class="last-sync"><span class="sync-dot"></span><span id="last-sync-text">数据更新于等待同步</span></span>
+              <button class="button button-secondary" id="refresh-button"><span class="refresh-icon">↻</span>重新采集</button>
+              <button class="button button-primary" id="open-import"><span class="plus">＋</span>导入公告</button>
+            </div>
+          </div>
+
+          <div class="view-container" id="view-container"></div>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
+
+    <div class="overlay" id="overlay"></div>
+    <section class="detail-drawer" id="detail-drawer" aria-label="公告详情">
+      <div class="drawer-header">
+        <div class="drawer-breadcrumb"><span>公告库</span><i>/</i><strong>公告详情</strong></div>
+        <button class="close-button" id="close-drawer" aria-label="关闭">×</button>
+      </div>
+      <div class="drawer-body" id="drawer-body"></div>
+    </section>
+
+    <div class="modal-backdrop" id="import-modal-backdrop">
+      <section class="modal import-modal" role="dialog" aria-modal="true" aria-labelledby="import-title">
+        <div class="modal-header">
+          <div><span class="modal-kicker">数据接入</span><h2 id="import-title">导入公告</h2></div>
+          <button class="close-button" data-close-modal aria-label="关闭">×</button>
+        </div>
+        <div class="import-tabs" role="tablist">
+          <button class="import-tab active" data-import-tab="url">URL 导入</button>
+          <button class="import-tab" data-import-tab="excel">Excel 台账</button>
+          <button class="import-tab" data-import-tab="file">文件解析</button>
+        </div>
+        <div class="import-panel active" data-import-panel="url">
+          <label class="field-label" for="url-input">公告链接 <span>支持批量，每行一个 URL</span></label>
+          <textarea id="url-input" class="textarea" placeholder="https://www.bidding.csg.cn/zbgg/1200432405.jhtml\nhttps://ecp.sgcc.com.cn/..." rows="4"></textarea>
+          <div class="input-hint"><span class="hint-icon">i</span>导入后将进入标准采集解析流水线，并执行重复检查。</div>
+        </div>
+        <div class="import-panel" data-import-panel="excel">
+          <div class="dropzone"><div class="drop-icon">▦</div><strong>拖拽台账文件到这里</strong><span>或 <u data-trigger-file="excel">选择文件</u>，支持 .xlsx / .xls</span><small>建议使用 V1 标准导入模板，单次不超过 10 MB</small><input id="excel-file" type="file" accept=".xlsx,.xls" hidden /></div>
+        </div>
+        <div class="import-panel" data-import-panel="file">
+          <div class="dropzone"><div class="drop-icon">⇧</div><strong>上传公告附件或压缩包</strong><span><u data-trigger-file="file">选择文件</u>，支持 PDF、Word、Excel、ZIP、RAR、7z、图片</span><small>压缩包将受控解压，原文件始终保留</small><input id="attachment-file" type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.zip,.rar,.7z,.png,.jpg,.jpeg,.tif,.tiff" hidden /></div>
+          <div class="file-source-row"><label class="field-label">来源 URL <span>可选</span></label><input class="input" placeholder="补充公告原网页链接" /></div>
+        </div>
+        <div class="modal-footer"><button class="button button-secondary" data-close-modal>取消</button><button class="button button-primary" id="confirm-import">开始预检 <span>→</span></button></div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="config-modal-backdrop">
+      <section class="modal config-modal" role="dialog" aria-modal="true" aria-labelledby="config-title">
+        <form id="config-form">
+          <div class="modal-header"><div><span class="modal-kicker">系统配置</span><h2 id="config-title">编辑配置</h2></div><button type="button" class="close-button" data-close-config aria-label="关闭">×</button></div>
+          <div class="config-form-body" id="config-fields"></div>
+          <div class="modal-footer"><button type="button" class="button button-secondary" data-close-config>取消</button><button type="submit" class="button button-primary">保存</button></div>
+        </form>
+      </section>
+    </div>
+
+    <script src="./app.js?v=20260907-4"></script>
+  </body>
+</html>

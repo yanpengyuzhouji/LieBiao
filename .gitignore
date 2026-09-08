@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+.venv/
+.runtime/
+.env
+.env.*
+!.env.example
+
+# Runtime business data (schema remains versioned in backend/db.py and migrations)
+data/
+backups/
+outputs/
+
+# Generated packages and build tools
+dist/
+build/
+release/
+packaging/build/
+packaging/tools/
+
+# Databases, logs and temporary files anywhere
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.tmp
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

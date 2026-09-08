@@ -106,7 +106,13 @@ def notice_policy_rejection(
 ) -> str | None:
     """Return a rejection reason when a candidate violates crawl policy."""
     normalized_type = str(notice_type or "").strip()
-    if allowed_categories and normalized_type not in allowed_categories:
+    def category_family(value: str) -> str:
+        compact = re.sub(r"\s+", "", value)
+        if compact in {"变更公告", "招标公告变更", "招标变更公告"} or ("招标" in compact and "变更" in compact):
+            return "招标公告"
+        return compact
+    normalized_allowed = {category_family(item) for item in allowed_categories}
+    if normalized_allowed and category_family(normalized_type) not in normalized_allowed:
         return f"公告类型“{normalized_type or '未知'}”不在任务范围"
     published = parse_notice_datetime(published_at)
     if published is None:
@@ -203,6 +209,7 @@ def frontend_notice(connection, row) -> dict[str, Any]:
         "mark": row["business_mark"], "markText": MARK_LABELS.get(row["business_mark"], row["business_mark"]),
         "bestHit": hits[0]["snippet"] if hits else "暂未命中关键词", "sourceUrl": row["source_url"], "detail": detail,
         "evidence": evidence, "files": file_items,
+        "isDeleted": bool(row["deleted_at"]), "deletedAt": beijing_time(row["deleted_at"]) if row["deleted_at"] else None,
     }
 
 
@@ -443,8 +450,12 @@ def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapte
     timestamp = now_iso()
     fingerprint = hashlib.sha256((data.title + "\n" + data.body_text).encode("utf-8", errors="ignore")).hexdigest()
     existing = connection.execute("SELECT * FROM notices WHERE site_id IS ? AND (external_id=? OR source_url=?) ORDER BY id LIMIT 1", (site_id, data.external_id, data.url)).fetchone()
+    if existing and existing["deleted_at"]:
+        if source_type == "crawl":
+            return None
+        raise AdapterError("该公告位于回收站，请先在回收站中恢复")
     created_new = existing is None
-    was_deleted = bool(existing and existing["deleted_at"])
+    content_changed = bool(existing and existing["content_fingerprint"] != fingerprint)
     if existing:
         notice_id = int(existing["id"])
         version = int(existing["current_version"])
@@ -507,14 +518,14 @@ def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapte
     if filter_unmatched and matched_groups == 0:
         if created_new:
             discard_unmatched_notice(connection, notice_id)
-        elif was_deleted:
-            # 软删除的历史记录保持删除状态，不能因未命中而复活。
-            connection.execute("UPDATE notices SET deleted_at=?,updated_at=? WHERE id=?", (existing["deleted_at"], now_iso(), notice_id))
         return None
     attachment_rows = connection.execute("SELECT status,parse_status FROM attachments WHERE notice_id=?", (notice_id,)).fetchall()
     has_attachment_issue = any(row["status"] in ("failed", "needs_tool") or row["parse_status"] in ("failed", "unsupported", "ocr_pending") for row in attachment_rows)
     connection.execute("UPDATE notices SET ingest_status=?,updated_at=? WHERE id=?", ("partial" if has_attachment_issue else "parsed", now_iso(), notice_id))
-    log_event(connection, "notice.ingest", f"公告{'新增入库' if created_new else '重复更新'}：{data.title}", notice_id=notice_id)
+    if created_new:
+        log_event(connection, "notice.ingest", f"公告新增入库：{data.title}", notice_id=notice_id)
+    elif content_changed:
+        log_event(connection, "notice.ingest", f"公告内容更新：{data.title}", notice_id=notice_id)
     return notice_id
 
 
@@ -596,14 +607,13 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
                 str(row["external_id"])
                 for row in connection.execute(
                     "SELECT n.external_id FROM notices n "
-                    "WHERE n.site_id=? AND n.deleted_at IS NULL AND n.external_id IS NOT NULL "
-                    "AND EXISTS (SELECT 1 FROM keyword_hits h WHERE h.notice_id=n.id AND h.is_negative=0 AND h.keyword_group_id IS ?)",
-                    (job["site_id"], job["keyword_group_id"]),
+                    "WHERE n.site_id=? AND n.external_id IS NOT NULL",
+                    (job["site_id"],),
                 ).fetchall()
             }
         # Date/type policy is applied twice: list metadata avoids unnecessary
         # detail requests, while detail metadata is authoritative before write.
-        candidate_limit = 10000
+        candidate_limit = max(1, int(job["max_notices"]))
         summaries = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -628,9 +638,11 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
                 if rejection:
                     record_filter(summary.title, rejection)
                     continue
-            elif allowed_categories and str(summary.notice_type or "").strip() not in allowed_categories:
-                record_filter(summary.title, f"公告类型“{summary.notice_type or '未知'}”不在任务范围")
-                continue
+            elif allowed_categories:
+                probe_rejection = notice_policy_rejection(now_iso(), summary.notice_type, cutoff, allowed_categories)
+                if probe_rejection and "公告类型" in probe_rejection:
+                    record_filter(summary.title, probe_rejection)
+                    continue
             try:
                 data: NoticeData | None = None
                 for attempt in range(1, max_attempts + 1):
@@ -696,7 +708,7 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
                 connection.execute("UPDATE crawl_jobs SET last_run_at=? WHERE id=?", (now_iso(), job_id))
             else:
                 connection.execute("UPDATE crawl_jobs SET last_run_at=?,schedule_anchor_at=NULL WHERE id=?", (now_iso(), job_id))
-            log_event(connection, "crawl.finish", f"采集批次完成：发现 {discovered} 条，关键词命中 {details} 条（首次新增 {created} 条，重复更新 {duplicates} 条），策略/关键词过滤 {filtered} 条，失败 {failed} 条", "WARNING" if reason else "INFO", crawl_run_id=run_id)
+            log_event(connection, "crawl.finish", f"采集批次完成：发现 {discovered} 条，命中 {details} 条，新增入库 {created} 条，重复命中 {duplicates} 条，策略/关键词过滤 {filtered} 条，失败 {failed} 条", "WARNING" if reason else "INFO", crawl_run_id=run_id)
 
 
 def create_run(job_id: int) -> int:

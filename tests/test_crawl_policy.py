@@ -34,6 +34,8 @@ class CrawlPolicyUnitTests(unittest.TestCase):
         self.assertIn("早于回溯边界", notice_policy_rejection("2026-09-02 23:59", "招标公告", cutoff, {"招标公告"}) or "")
         self.assertIn("缺少可解析", notice_policy_rejection(None, "招标公告", cutoff, {"招标公告"}) or "")
         self.assertIn("不在任务范围", notice_policy_rejection("2026-09-04", "采购公告", cutoff, {"招标公告"}) or "")
+        self.assertIsNone(notice_policy_rejection("2026-09-04", "招标公告变更", cutoff, {"招标公告"}))
+        self.assertIsNone(notice_policy_rejection("2026-09-04", "变更公告", cutoff, {"招标公告"}))
         self.assertIsNone(parse_notice_datetime("2026-09-03 invalid"))
         self.assertIsNone(parse_notice_datetime("x2026-09-03y"))
 
@@ -52,9 +54,13 @@ class CrawlPolicyIntegrationTests(unittest.TestCase):
                 class FakeAdapter:
                     def __init__(self) -> None:
                         self.fetch_attempts: dict[str, int] = {}
+                        self.list_limit = None
+                        self.excluded = set()
 
                     def list_notices(self, max_pages, max_notices, exclude_external_ids=None):
-                        del max_pages, max_notices, exclude_external_ids
+                        del max_pages
+                        self.list_limit = max_notices
+                        self.excluded = set(exclude_external_ids or ())
                         return [
                             NoticeSummary("old", "过期储能公告", "https://example.com/old", old, "招标公告"),
                             NoticeSummary("recent", "近期储能公告", "https://example.com/recent", recent, "招标公告"),
@@ -126,11 +132,13 @@ class CrawlPolicyIntegrationTests(unittest.TestCase):
                 self.assertNotIn("old", adapter.fetch_attempts)
                 self.assertNotIn("wrong-type", adapter.fetch_attempts)
                 self.assertEqual(adapter.fetch_attempts["retry"], 2)
+                self.assertEqual(adapter.list_limit, 10)
+                self.assertIn("recent", adapter.excluded)
                 self.assertEqual(policy_logs, 3)
                 self.assertEqual(retry_logs, 1)
                 with get_db() as connection:
                     finish = connection.execute("SELECT message FROM system_logs WHERE crawl_run_id=? AND event_type='crawl.finish'", (run_id,)).fetchone()["message"]
-                self.assertIn("关键词命中 2 条（首次新增 1 条，重复更新 1 条）", finish)
+                self.assertIn("命中 2 条，新增入库 1 条，重复命中 1 条", finish)
             finally:
                 settings.data_dir = original_data_dir
 

@@ -4,11 +4,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from backend.adapters import NoticeData
 from backend.config import settings
 from backend.db import get_db, init_db, now_iso
-from backend.main import list_notices
+from backend.main import list_notices, site_health_check
 from backend.service import attachment_tree_needs_reparse, create_attachment, find_site, ingest_notice_data, refresh_notice_analysis, try_create_run
 from backend.stabilization_migration import migrate_stabilization_schema
 from backend.storage import save_raw_html
@@ -126,6 +127,42 @@ class StabilityIntegrationTests(unittest.TestCase):
         self.assertEqual(unsearched_recovery["category_counts"]["all"], normal_counts["all"])
         self.assertEqual(unsearched_recovery["category_counts"]["pending"], normal_counts["pending"])
         self.assertEqual(unsearched_recovery["category_counts"]["focus"], normal_counts["focus"])
+
+    def test_recycle_bin_lists_deleted_notice_and_crawl_cannot_restore_it(self) -> None:
+        with get_db() as connection:
+            group = connection.execute("SELECT id FROM keyword_groups ORDER BY id LIMIT 1").fetchone()["id"]
+            notice = NoticeData("trash-1", "储能采购招标公告", "https://example.com/trash-1", "采购储能设备。")
+            notice_id = ingest_notice_data(connection, 1, notice, keyword_group_id=group, download_attachments=False)
+            deleted_at = now_iso()
+            connection.execute("UPDATE notices SET deleted_at=? WHERE id=?", (deleted_at, notice_id))
+            result = ingest_notice_data(connection, 1, notice, keyword_group_id=group, download_attachments=False, source_type="crawl")
+            row = connection.execute("SELECT deleted_at FROM notices WHERE id=?", (notice_id,)).fetchone()
+        self.assertIsNone(result)
+        self.assertEqual(row["deleted_at"], deleted_at)
+        trash = list_notices(only_deleted=True, only_matched=False, limit=10, offset=0)
+        self.assertEqual(trash["total"], 1)
+        self.assertEqual(trash["category_counts"]["trash"], 1)
+        self.assertEqual(trash["items"][0]["id"], str(notice_id))
+
+    def test_health_check_reuses_verified_manual_session(self) -> None:
+        with get_db() as connection:
+            site = connection.execute("SELECT id FROM sites ORDER BY id LIMIT 1").fetchone()
+            connection.execute(
+                "INSERT INTO site_accounts(site_id,alias,login_mode,credential_ref,session_status,last_login_at,status_reason,enabled,created_at) VALUES(?,?,'manual_session',?,'verified',?,'人工验证成功',1,?)",
+                (site["id"], "人工验证会话", "SESSION=verified", now_iso(), now_iso()),
+            )
+
+        class HealthyAdapter:
+            def health_check(self):
+                return {"ok": True, "status_code": 200, "message": "正常"}
+
+            def close(self):
+                return None
+
+        with patch("backend.main.make_adapter", return_value=HealthyAdapter()) as factory:
+            result = site_health_check(site["id"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(factory.call_args.kwargs["session_cookie"], "SESSION=verified")
 
 
 if __name__ == "__main__":

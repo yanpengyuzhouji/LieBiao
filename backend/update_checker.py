@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+import threading
 from urllib.parse import urlparse
 
 import httpx
@@ -60,3 +61,44 @@ def check_update(current_version: str, manifest_url: str) -> dict:
         "notes": str(payload.get("body") or payload.get("notes") or "")[:4000],
         "published_at": payload.get("published_at"),
     }
+
+
+class UpdateMonitor:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._status: dict = {"enabled": False, "available": False}
+
+    def start(self, current_version: str, manifest_url: str, enabled: bool, interval_seconds: float = 3600) -> None:
+        self.stop()
+        self._stop.clear()
+        self._status = {"enabled": enabled, "available": False, "current_version": current_version}
+        if not enabled:
+            return
+
+        def run() -> None:
+            while not self._stop.is_set():
+                try:
+                    result = {"enabled": True, **check_update(current_version, manifest_url)}
+                except UpdateCheckError:
+                    result = {"enabled": True, "available": False, "current_version": current_version, "error": "更新检查暂时不可用"}
+                with self._lock:
+                    self._status = result
+                self._stop.wait(interval_seconds)
+
+        self._thread = threading.Thread(target=run, name="update-checker", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1)
+        self._thread = None
+
+    def status(self) -> dict:
+        with self._lock:
+            return dict(self._status)
+
+
+update_monitor = UpdateMonitor()

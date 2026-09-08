@@ -118,6 +118,8 @@ class AdapterParsingTests(unittest.TestCase):
             def post(inner_self, _url: str, json: dict, headers: dict) -> AdapterParsingTests.JsonResponse:
                 del headers
                 self.assertEqual(json["start"], 0)
+                self.assertEqual(json["currentPage"], 1)
+                self.assertEqual(json["pageSize"], 50)
                 return self.JsonResponse({"status": True, "data": {"root": [{
                     "noticeId": "9001", "noticeTitle": "变压器招标公告", "noticeTypeName": "招标公告",
                     "releaseTime": "2026-09-08 10:00:00", "bidOpeningTime": "2026-09-18 09:00:00",
@@ -132,6 +134,27 @@ class AdapterParsingTests(unittest.TestCase):
         self.assertIn("noticeId=9001", rows[0].url)
         self.assertEqual(rows[0].detail_id, "static/2026_9/a.txt")
 
+    def test_epec_stops_when_backend_repeats_the_same_page(self) -> None:
+        class Client:
+            def __init__(inner_self) -> None:
+                inner_self.requests = []
+
+            def post(inner_self, _url: str, json: dict, headers: dict) -> AdapterParsingTests.JsonResponse:
+                del headers
+                inner_self.requests.append(json)
+                return self.JsonResponse({"status": True, "data": {"root": [{
+                    "noticeId": "same", "noticeTitle": "重复页公告", "noticeTypeName": "招标公告",
+                    "releaseTime": "2026-09-08 10:00:00", "noticeType": "01", "attachUrl": "a.txt",
+                }] * 50, "totalCount": 500}})
+
+        adapter = EpecAdapter.__new__(EpecAdapter)
+        adapter.base_url = "https://bidding.epec.com/"
+        adapter.client = Client()
+        rows = adapter.list_notices(max_pages=50, max_notices=100)
+        self.assertEqual([row.external_id for row in rows], ["same"])
+        self.assertEqual(len(adapter.client.requests), 2)
+        self.assertEqual(adapter.client.requests[1]["currentPage"], 2)
+
     def test_cdt_list_uses_public_message_type_zero(self) -> None:
         class Client:
             def post(inner_self, _url: str, data: dict, headers: dict) -> AdapterParsingTests.JsonResponse:
@@ -145,6 +168,26 @@ class AdapterParsingTests(unittest.TestCase):
         rows = adapter.list_notices()
         self.assertEqual(rows[0].external_id, "1881919")
         self.assertTrue(rows[0].url.endswith("moreall?id=1881919"))
+        self.assertEqual(rows[0].notice_type, "采购公告")
+
+    def test_cdt_extracts_pdf_url_from_detail_script(self) -> None:
+        class Response:
+            headers = {"content-type": "text/html;charset=utf-8"}
+            text = '''<html><h1>风机招标公告</h1><div class="content">发布时间：2026-09-08</div>
+                <script>var pdf="http://bid.cdt-ec.com/dtdzzb/cgUploadController.do?downLoadFileOut&extend=pdf&objId=abc123";</script></html>'''
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class Client:
+            def get(self, _url: str) -> Response:
+                return Response()
+
+        adapter = CdtAdapter.__new__(CdtAdapter)
+        adapter.client = Client()
+        notice = adapter.fetch_notice("https://tang.cdt-ec.com/notice/moreController/moreall?id=1", "1")
+        self.assertEqual(len(notice.attachments), 1)
+        self.assertEqual(notice.attachments[0].url, "https://bid.cdt-ec.com/dtdzzb/cgUploadController.do?downLoadFileOut&extend=pdf&objId=abc123")
 
     def test_chng_rewrites_hash_detail_to_public_html(self) -> None:
         adapter = ChngAdapter.__new__(ChngAdapter)

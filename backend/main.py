@@ -30,7 +30,7 @@ from .stabilization_migration import migrate_stabilization_schema
 from . import reparse_tasks
 from .maintenance import activity
 from .migration import adopt_storage, migrate_storage
-from .update_checker import UpdateCheckError, check_update
+from .update_checker import update_monitor
 from .manual_verification import ManualVerificationError, close_verification, complete_verification, open_verification
 
 
@@ -165,10 +165,12 @@ def startup() -> None:
     recover_incomplete_runs()
     reparse_tasks.initialize(recover=True)
     scheduler.start()
+    update_monitor.start(APP_VERSION, settings.update_url, settings.update_enabled)
 
 
 @app.on_event("shutdown")
 def shutdown() -> None:
+    update_monitor.stop()
     scheduler.stop()
 
 
@@ -194,12 +196,7 @@ def get_parser_capabilities():
 
 @app.get("/api/update/check")
 def get_update_status() -> dict[str, Any]:
-    if not settings.update_enabled:
-        return {"enabled": False, "available": False, "current_version": APP_VERSION}
-    try:
-        return {"enabled": True, **check_update(APP_VERSION, settings.update_url)}
-    except UpdateCheckError as exc:
-        return {"enabled": True, "available": False, "current_version": APP_VERSION, "error": str(exc)}
+    return update_monitor.status()
 
 
 def _copy_storage_tree(source: Path, target: Path) -> None:
@@ -306,9 +303,13 @@ def site_health_check(site_id: int) -> dict[str, Any]:
     validate_id(site_id, "平台")
     with get_db() as connection:
         site = connection.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+        account = connection.execute(
+            "SELECT credential_ref FROM site_accounts WHERE site_id=? AND enabled=1 AND session_status='verified' ORDER BY last_login_at DESC,id DESC LIMIT 1",
+            (site_id,),
+        ).fetchone()
     if not site:
         raise HTTPException(status_code=404, detail="平台不存在")
-    adapter = make_adapter(site["code"], site["base_url"])
+    adapter = make_adapter(site["code"], site["base_url"], session_cookie=account["credential_ref"] if account else None)
     try:
         result = adapter.health_check()
     finally:
@@ -323,12 +324,24 @@ def site_health_check(site_id: int) -> dict[str, Any]:
 def open_site_verification(site_id: int) -> dict[str, Any]:
     validate_id(site_id, "平台")
     with get_db() as connection:
-        site = connection.execute("SELECT id,base_url FROM sites WHERE id=?", (site_id,)).fetchone()
+        site = connection.execute("SELECT id,name,base_url FROM sites WHERE id=?", (site_id,)).fetchone()
     if not site:
         raise HTTPException(status_code=404, detail="平台不存在")
     try:
         return open_verification(site_id, site["base_url"], settings.data_dir / "browser_sessions")
     except ManualVerificationError as exc:
+        with get_db() as connection:
+            timestamp = now_iso()
+            message = str(exc)
+            connection.execute(
+                "UPDATE sites SET health_status='unhealthy',health_message=?,last_checked_at=? WHERE id=?",
+                (message, timestamp, site_id),
+            )
+            connection.execute(
+                "UPDATE site_accounts SET session_status='needs_manual',status_reason=? WHERE site_id=? AND alias='人工验证会话'",
+                (message, site_id),
+            )
+            log_event(connection, "site.manual_verify", f"{site['name']}：{message}", "WARNING")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -373,6 +386,18 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
             log_event(connection, "site.manual_verify", f"{site['name']}：人工验证成功，会话已绑定采集任务")
         return {"ok": True, "message": "人工验证成功，已绑定该平台采集任务，可立即采集"}
     except ManualVerificationError as exc:
+        with get_db() as connection:
+            timestamp = now_iso()
+            message = str(exc)
+            connection.execute(
+                "UPDATE sites SET health_status='unhealthy',health_message=?,last_checked_at=? WHERE id=?",
+                (message, timestamp, site_id),
+            )
+            connection.execute(
+                "UPDATE site_accounts SET session_status='needs_manual',status_reason=? WHERE site_id=? AND alias='人工验证会话'",
+                (message, site_id),
+            )
+            log_event(connection, "site.manual_verify", f"{site['name']}：{message}", "WARNING")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         close_verification(site_id)
@@ -627,7 +652,7 @@ def dashboard() -> dict[str, Any]:
 
 
 @app.get("/api/notices")
-def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: str = "all", attachment: str = "all", only_issues: bool = False, only_matched: bool = True, only_unmatched: bool = False, include_deleted: bool = False, limit: int = Query(default=10, ge=1, le=100), offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
+def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: str = "all", attachment: str = "all", only_issues: bool = False, only_matched: bool = True, only_unmatched: bool = False, include_deleted: bool = False, only_deleted: bool = False, limit: int = Query(default=10, ge=1, le=100), offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
     possible_missed_match = """n.source_type='crawl'
         AND NOT EXISTS (SELECT 1 FROM keyword_hits mh WHERE mh.notice_id=n.id AND mh.is_negative=0)
         AND (n.ingest_status IN ('failed','partial') OR EXISTS (
@@ -637,8 +662,6 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
         ))"""
     clauses = ["1=1"]
     params: list[Any] = []
-    if not include_deleted:
-        clauses.append("n.deleted_at IS NULL")
     if q:
         clauses.append("(n.title LIKE ? OR n.project_number LIKE ? OR n.demand_unit LIKE ? OR n.summary LIKE ? OR EXISTS (SELECT 1 FROM keyword_hits qh WHERE qh.notice_id=n.id AND qh.is_negative=0 AND (qh.keyword LIKE ? OR qh.snippet LIKE ?)))")
         params.extend([f"%{q}%"] * 6)
@@ -648,8 +671,14 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
         clauses.append("EXISTS (SELECT 1 FROM attachments af WHERE af.notice_id=n.id)")
     elif attachment == "no":
         clauses.append("NOT EXISTS (SELECT 1 FROM attachments af WHERE af.notice_id=n.id)")
-    scope_clauses = list(clauses)
-    scope_params = list(params)
+    base_clauses = list(clauses)
+    base_params = list(params)
+    if only_deleted:
+        clauses.append("n.deleted_at IS NOT NULL")
+    elif not include_deleted:
+        clauses.append("n.deleted_at IS NULL")
+    scope_clauses = base_clauses + ["n.deleted_at IS NULL"]
+    scope_params = list(base_params)
     if only_unmatched:
         clauses.append(possible_missed_match)
     elif only_matched:
@@ -682,6 +711,10 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
             f"SELECT COUNT(*) FROM notices n LEFT JOIN sites s ON s.id=n.site_id WHERE {' AND '.join(scope_clauses)} AND {possible_missed_match}",
             scope_params,
         ).fetchone()[0]
+        trash_count = connection.execute(
+            f"SELECT COUNT(*) FROM notices n LEFT JOIN sites s ON s.id=n.site_id WHERE {' AND '.join(base_clauses)} AND n.deleted_at IS NOT NULL",
+            base_params,
+        ).fetchone()[0]
         items = [frontend_notice(connection, row) for row in rows]
     return {
         "items": items, "total": total, "limit": limit, "offset": offset,
@@ -691,6 +724,7 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
             "focus": int(category_counts["focus_count"] or 0),
             "issues": int(category_counts["issues_count"] or 0),
             "unmatched": int(unmatched_count or 0),
+            "trash": int(trash_count or 0),
         },
     }
 

@@ -453,10 +453,16 @@ class EpecAdapter(BaseAdapter):
     def list_notices(self, max_pages: int = 1, max_notices: int = 100, list_url: str | None = None, exclude_external_ids: set[str] | None = None) -> list[NoticeSummary]:
         del list_url
         result: list[NoticeSummary] = []
+        seen: set[str] = set()
         excluded = exclude_external_ids or set()
         page_size = min(50, max_notices)
+        previous_page_ids: tuple[str, ...] | None = None
         for page in range(max_pages):
-            request = {"model": {"noticeTypeList": ["01", "11"]}, "start": page * page_size, "limit": page_size}
+            request = {
+                "model": {"noticeTypeList": ["01", "11"]},
+                "currentPage": page + 1, "pageSize": page_size,
+                "start": page * page_size, "limit": page_size,
+            }
             try:
                 response = self.client.post(self.api_url, json=request, headers={"Content-Type": "application/json", "Referer": self.base_url})
                 response.raise_for_status()
@@ -464,11 +470,16 @@ class EpecAdapter(BaseAdapter):
             except (httpx.HTTPError, ValueError) as exc:
                 raise AdapterError(f"中国石化公告列表访问失败：{exc}") from exc
             rows = ((payload.get("data") or {}).get("root") or []) if payload.get("status") else []
+            page_ids = tuple(str(row.get("noticeId") or "") for row in rows)
+            if page > 0 and page_ids and page_ids == previous_page_ids:
+                break
+            previous_page_ids = page_ids
             for row in rows:
                 notice_id = str(row.get("noticeId") or "")
                 title = str(row.get("noticeTitle") or "").strip()
-                if not notice_id or not title or notice_id in excluded:
+                if not notice_id or not title or notice_id in excluded or notice_id in seen:
                     continue
+                seen.add(notice_id)
                 query = urlencode({
                     "noticeId": notice_id, "type": row.get("noticeType") or "01",
                     "businessId": row.get("businessId") or "", "attachUrl": row.get("attachUrl") or "",
@@ -615,7 +626,7 @@ class CdtAdapter(BaseAdapter):
                 result.append(NoticeSummary(
                     notice_id, title,
                     f"https://tang.cdt-ec.com/notice/moreController/moreall?id={notice_id}",
-                    row.get("publish_time"), "招标公告",
+                    row.get("publish_time"), self._notice_type_from_title(title),
                 ))
                 if len(result) >= max_notices:
                     return result
@@ -624,6 +635,46 @@ class CdtAdapter(BaseAdapter):
         if not result:
             raise AdapterError("大唐集团公开公告列表未返回可识别数据")
         return result
+
+    @staticmethod
+    def _notice_type_from_title(title: str) -> str:
+        if "资格预审" in title or "资审公告" in title:
+            return "资格预审公告"
+        if "采购公告" in title:
+            return "采购公告"
+        return "招标公告"
+
+    def fetch_notice(self, url: str, external_id: str | None = None, detail_id: str | None = None) -> NoticeData:
+        del detail_id
+        try:
+            response = self.client.get(url)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise AdapterError(f"大唐集团公告详情访问失败：{exc}") from exc
+        raw_html = response.text
+        lowered = raw_html.lower()
+        if "aliyunwaf" in lowered or re.search(r"\barg1\s*=", raw_html):
+            raise AdapterError("大唐集团详情页触发平台安全验证，请重新完成人工验证")
+        parser = PageParser()
+        parser.feed(raw_html)
+        full_text = clean_text(parser.text_parts)
+        body = clean_text(parser.content_parts or parser.text_parts)
+        title = clean_text(parser.heading_parts).strip() or clean_text(parser.title_parts).strip(" -_|") or str(external_id or extract_external_id(url))
+        attachments = self._attachments_from_links(parser.links, url)
+        seen_urls = {item.url for item in attachments}
+        pdf_pattern = re.compile(r"https?://bid\.cdt-ec\.com/dtdzzb/cgUploadController\.do\?downLoadFileOut&extend=pdf&objId=[^\"'<>\s]+", re.I)
+        for match in pdf_pattern.findall(raw_html):
+            pdf_url = re.sub(r"^http://", "https://", match, flags=re.I)
+            if pdf_url not in seen_urls:
+                seen_urls.add(pdf_url)
+                attachments.append(AttachmentInfo(name=f"大唐公告-{external_id or extract_external_id(url)}.pdf", url=pdf_url))
+        return NoticeData(
+            external_id=str(external_id or extract_external_id(url)), title=title, url=url,
+            body_text=body, raw_html=raw_html,
+            published_at=first_date(full_text, ("发布时间", "发布日期", "公告时间")),
+            opening_at=first_date(body, ("开标时间", "投标截止时间", "递交截止时间")),
+            notice_type=self._notice_type_from_title(title), attachments=attachments,
+        )
 
 
 ADAPTERS = {

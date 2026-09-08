@@ -3,7 +3,7 @@ const notices = [];
 const appState = {
   view: 'notices', tab: 'all', query: '', platform: 'all', mark: 'all', attachment: 'all', selected: new Set(), detailId: null, detailTab: 'info', importTab: 'url',
   keywordGroups: [], jobs: [], sites: [], logs: [], runs: [], dashboard: null, scheduler: null, config: null, page: 1, pageSize: 10, totalNotices: 0,
-  noticeCounts: { all: 0, pending: 0, focus: 0, issues: 0, unmatched: 0 }
+  noticeCounts: { all: 0, pending: 0, focus: 0, issues: 0, unmatched: 0, trash: 0 }
 };
 
 let backendOnline = false;
@@ -96,13 +96,16 @@ async function loadBackendNotices(resetPage = true) {
   if (appState.tab === 'unmatched') {
     params.set('only_matched', 'false');
     params.set('only_unmatched', 'true');
+  } else if (appState.tab === 'trash') {
+    params.set('only_matched', 'false');
+    params.set('only_deleted', 'true');
   }
   try {
     const payload = await apiFetch(`/api/notices?${params.toString()}`);
     backendOnline = true;
     notices.splice(0, notices.length, ...(payload.items || []).map(normalizeBackendNotice));
     appState.totalNotices = Number(payload.total || 0);
-    appState.noticeCounts = payload.category_counts || { all: appState.totalNotices, pending: 0, focus: 0, issues: 0, unmatched: 0 };
+    appState.noticeCounts = payload.category_counts || { all: appState.totalNotices, pending: 0, focus: 0, issues: 0, unmatched: 0, trash: 0 };
     const pageCount = Math.max(1, Math.ceil(appState.totalNotices / appState.pageSize));
     if (appState.page > pageCount) {
       appState.page = pageCount;
@@ -123,7 +126,7 @@ async function loadBackendNotices(resetPage = true) {
     backendOnline = false;
     notices.splice(0, notices.length);
     appState.totalNotices = 0;
-    appState.noticeCounts = { all: 0, pending: 0, focus: 0, issues: 0, unmatched: 0 };
+    appState.noticeCounts = { all: 0, pending: 0, focus: 0, issues: 0, unmatched: 0, trash: 0 };
     const count = $('#notice-nav-count');
     if (count) count.textContent = '0';
     const sync = $('#last-sync-text');
@@ -249,6 +252,13 @@ async function persistDelete(ids) {
   });
 }
 
+async function persistRestore(ids) {
+  const numericIds = ids.filter(id => /^\d+$/.test(String(id)));
+  if (backendOnline && numericIds.length) {
+    await Promise.all(numericIds.map(id => apiFetch(`/api/notices/${id}/restore`, { method: 'POST' })));
+  }
+}
+
 const viewMeta = {
   overview: ['采集总览', '统计数据以后端数据库为准，今日新增按首次入库时间计算。'],
   notices: ['公告库', '汇总已接入平台的最新招标信息，快速确认与跟进。'],
@@ -317,7 +327,7 @@ function noticeRow(notice) {
     <td><div class="hit-list">${hits}</div><div class="notice-meta" style="margin-top:5px">${esc(notice.bestHit)}</div></td>
     <td><div class="attachment-cell"><span class="attachment-icon">⌕</span><strong>${notice.attachments}</strong><span>个</span><small title="关键文件需人工标记">/ ${notice.keyFiles} 关键</small></div></td>
     <td><span class="status-tag status-${notice.status}">${notice.statusText}</span><div style="margin-top:5px"><span class="mark-tag mark-${notice.mark}">${notice.markText}</span></div></td>
-    <td><div class="row-actions"><button class="row-open" data-open-detail="${notice.id}" aria-label="查看详情">↗</button><button class="row-more" aria-label="更多操作">···</button></div></td>
+    <td><div class="row-actions"><button class="row-open" data-open-detail="${notice.id}" aria-label="查看详情">↗</button>${notice.isDeleted ? `<button class="batch-action" data-restore-notice="${notice.id}">恢复</button>` : '<button class="row-more" aria-label="更多操作">···</button>'}</div></td>
   </tr>`;
 }
 
@@ -363,6 +373,7 @@ function renderNotices() {
   const focus = counts.focus;
   const issues = counts.issues;
   const unmatched = counts.unmatched || 0;
+  const trash = counts.trash || 0;
   return `${renderStats()}${renderDataStrip()}<div class="toolbar-card">
     <div class="filter-tabs">
       <button class="filter-tab ${appState.tab === 'all' ? 'active' : ''}" data-filter-tab="all">全部 <span class="tab-number">${total}</span></button>
@@ -370,6 +381,7 @@ function renderNotices() {
       <button class="filter-tab ${appState.tab === 'focus' ? 'active' : ''}" data-filter-tab="focus">重点关注 <span class="tab-number">${focus}</span></button>
       <button class="filter-tab ${appState.tab === 'issues' ? 'active' : ''}" data-filter-tab="issues">解析异常 <span class="tab-number">${issues}</span></button>
       <button class="filter-tab ${appState.tab === 'unmatched' ? 'active' : ''}" data-filter-tab="unmatched" title="未命中关键词且存在解析异常或待处理附件">可能漏匹配 <span class="tab-number">${unmatched}</span></button>
+      <button class="filter-tab ${appState.tab === 'trash' ? 'active' : ''}" data-filter-tab="trash">回收站 <span class="tab-number">${trash}</span></button>
     </div>
     <div class="filter-row">
       <label class="search-box"><span class="search-icon">⌕</span><input id="notice-search" value="${esc(appState.query)}" placeholder="搜索标题、项目编号或需求单位" /></label>
@@ -378,7 +390,7 @@ function renderNotices() {
       <label class="select-wrap"><select id="attachment-filter"><option value="all">附件情况</option><option value="yes" ${appState.attachment === 'yes' ? 'selected' : ''}>有附件</option><option value="no" ${appState.attachment === 'no' ? 'selected' : ''}>无附件</option></select></label>
       <button class="filter-more"><span>＋</span>更多筛选</button>
     </div>
-    <div class="batch-bar ${appState.selected.size ? 'visible' : ''}" id="batch-bar"><span>已选择 <strong id="selected-count">${appState.selected.size}</strong> 条</span><div class="batch-actions"><button class="batch-action" data-batch-mark="relevant">标记为相关</button><button class="batch-action" data-batch-mark="focus">设为重点</button><button class="batch-action danger" data-batch-delete>批量删除</button></div></div>
+    <div class="batch-bar ${appState.selected.size ? 'visible' : ''}" id="batch-bar"><span>已选择 <strong id="selected-count">${appState.selected.size}</strong> 条</span><div class="batch-actions">${appState.tab === 'trash' ? '<button class="batch-action" data-batch-restore>批量恢复</button>' : '<button class="batch-action" data-batch-mark="relevant">标记为相关</button><button class="batch-action" data-batch-mark="focus">设为重点</button><button class="batch-action danger" data-batch-delete>批量删除</button>'}</div></div>
   </div>
   <div class="table-card"><div class="table-scroll"><table><thead><tr><th><input class="checkbox" id="select-all" type="checkbox" aria-label="全选" /></th><th style="width:27%">公告标题 / 来源</th><th>发布时间</th><th>开标时间</th><th>需求单位</th><th style="width:18%">项目摘要</th><th>关键词命中</th><th>附件</th><th>状态 / 标记</th><th></th></tr></thead><tbody id="notice-tbody"></tbody></table></div><div class="table-footer"><span>显示 <strong id="result-count">0</strong> 条结果，共 ${total} 条公告（每页 10 条）</span><div class="pagination" id="pagination-controls"></div></div></div>`;
 }
@@ -442,7 +454,7 @@ function renderJobs() {
 }
 
 function renderLivePlatforms() {
-  return `<section class="panel-card"><div class="panel-head"><div><h3>平台与账号 <span style="color:#9da7b7;font-family:'DM Mono';font-size:10px">${appState.sites.length}</span></h3><p>遇到平台安全验证时，可打开专用窗口人工完成验证，再回到这里保存会话。</p></div></div><div class="panel-body"><table class="platform-table"><thead><tr><th>平台</th><th>采集模式</th><th>连通状态</th><th>最近检查（北京时间）</th><th>操作</th></tr></thead><tbody>${appState.sites.map(site => `<tr><td><div class="platform-name"><span class="platform-logo ${site.code === 'csg' ? 'green' : ['sgcc', 'epec', 'cdt'].includes(site.code) ? 'orange' : ''}">${esc(site.name.slice(0, 1))}</span>${esc(site.name)}</div></td><td>公开公告（免登录）</td><td><span class="account-status">${esc(site.health_status === 'healthy' ? '正常' : site.health_status === 'unhealthy' ? '异常' : '未检查')}</span></td><td>${esc(beijingDateTime(site.last_checked_at))}</td><td><div class="row-actions-inline"><button class="batch-action" data-health-site="${site.id}">健康检查</button><button class="batch-action" data-open-verification="${site.id}">打开人工验证</button><button class="batch-action" data-complete-verification="${site.id}">验证完成</button></div></td></tr>`).join('')}</tbody></table></div></section>`;
+  return `<section class="panel-card"><div class="panel-head"><div><h3>平台与账号 <span style="color:#9da7b7;font-family:'DM Mono';font-size:10px">${appState.sites.length}</span></h3><p>遇到平台安全验证时，可打开专用窗口人工完成验证，再回到这里保存会话。</p></div></div><div class="panel-body"><table class="platform-table"><thead><tr><th>平台</th><th>采集模式</th><th>人工会话</th><th>连通状态</th><th>最近检查（北京时间）</th><th>操作</th></tr></thead><tbody>${appState.sites.map(site => { const account = (site.accounts || []).find(item => item.enabled && item.session_status === 'verified'); return `<tr><td><div class="platform-name"><span class="platform-logo ${site.code === 'csg' ? 'green' : ['sgcc', 'epec', 'cdt'].includes(site.code) ? 'orange' : ''}">${esc(site.name.slice(0, 1))}</span>${esc(site.name)}</div></td><td>公开公告（免登录）</td><td><span class="account-status" title="${esc(account ? account.status_reason || '' : '尚未保存人工验证会话')}">${account ? '已验证' : '未验证'}</span></td><td><span class="account-status" title="${esc(site.health_message || '')}">${esc(site.health_status === 'healthy' ? '正常' : site.health_status === 'unhealthy' ? '异常' : '未检查')}</span></td><td>${esc(beijingDateTime(site.last_checked_at))}</td><td><div class="row-actions-inline"><button class="batch-action" data-health-site="${site.id}">健康检查</button><button class="batch-action" data-open-verification="${site.id}">打开人工验证</button><button class="batch-action" data-complete-verification="${site.id}">验证完成</button></div></td></tr>`; }).join('')}</tbody></table></div></section>`;
 }
 
 function renderPlatforms() {
@@ -532,7 +544,8 @@ function detailFiles(notice) {
 function renderDrawer(notice) {
   const body = $('#drawer-body');
   const tabContent = appState.detailTab === 'info' ? detailInfo(notice) : appState.detailTab === 'evidence' ? detailEvidence(notice) : detailFiles(notice);
-  body.innerHTML = `<div class="drawer-title-block"><div class="drawer-badges"><span class="source-chip ${notice.platformClass}">${notice.platformName}</span><span class="status-tag status-${notice.status}">${notice.statusText}</span><span class="mark-tag mark-${notice.mark}">${notice.markText}</span></div><h2 class="drawer-title">${esc(notice.title)}</h2><div class="drawer-source"><span>来源链接</span><a href="${esc(notice.sourceUrl || '#')}" target="_blank" rel="noreferrer">打开原公告 ↗</a><span style="margin-left:auto;color:#a1aabb">采集于 ${esc(notice.date)}</span></div><div class="drawer-actions"><button class="button button-primary" data-drawer-mark="relevant">标记为相关</button><button class="button button-secondary" data-drawer-mark="focus">重点关注</button><button class="button button-secondary" data-reparse-notice>重新解析</button><button class="button button-danger" data-drawer-delete>软删除</button></div></div><div class="drawer-tabs"><button class="filter-tab ${appState.detailTab === 'info' ? 'active' : ''}" data-detail-tab="info">项目信息</button><button class="filter-tab ${appState.detailTab === 'evidence' ? 'active' : ''}" data-detail-tab="evidence">命中证据 <span class="tab-number">${notice.evidence.length}</span></button><button class="filter-tab ${appState.detailTab === 'files' ? 'active' : ''}" data-detail-tab="files">附件文件 <span class="tab-number">${notice.attachments}</span></button></div>${tabContent}`;
+  const actions = notice.isDeleted ? '<button class="button button-primary" data-drawer-restore>恢复到公告库</button>' : '<button class="button button-primary" data-drawer-mark="relevant">标记为相关</button><button class="button button-secondary" data-drawer-mark="focus">重点关注</button><button class="button button-secondary" data-reparse-notice>重新解析</button><button class="button button-danger" data-drawer-delete>软删除</button>';
+  body.innerHTML = `<div class="drawer-title-block"><div class="drawer-badges"><span class="source-chip ${notice.platformClass}">${notice.platformName}</span><span class="status-tag status-${notice.status}">${notice.statusText}</span><span class="mark-tag mark-${notice.mark}">${notice.markText}</span></div><h2 class="drawer-title">${esc(notice.title)}</h2><div class="drawer-source"><span>来源链接</span><a href="${esc(notice.sourceUrl || '#')}" target="_blank" rel="noreferrer">打开原公告 ↗</a><span style="margin-left:auto;color:#a1aabb">${notice.isDeleted ? `删除于 ${esc(beijingDateTime(notice.deletedAt))}` : `采集于 ${esc(notice.date)}`}</span></div><div class="drawer-actions">${actions}</div></div><div class="drawer-tabs"><button class="filter-tab ${appState.detailTab === 'info' ? 'active' : ''}" data-detail-tab="info">项目信息</button><button class="filter-tab ${appState.detailTab === 'evidence' ? 'active' : ''}" data-detail-tab="evidence">命中证据 <span class="tab-number">${notice.evidence.length}</span></button><button class="filter-tab ${appState.detailTab === 'files' ? 'active' : ''}" data-detail-tab="files">附件文件 <span class="tab-number">${notice.attachments}</span></button></div>${tabContent}`;
 }
 
 function openDetail(id) {
@@ -660,6 +673,9 @@ document.addEventListener('click', event => {
   const batchMark = event.target.closest('[data-batch-mark]');
   if (batchMark) { const ids = Array.from(appState.selected); const mark = batchMark.dataset.batchMark; persistMark(ids, mark).then(() => { appState.selected.clear(); showToast('已更新所选公告的业务标记'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
   if (event.target.closest('[data-batch-delete]')) { const ids = Array.from(appState.selected); persistDelete(ids).then(() => { appState.selected.clear(); showToast('已将所选公告移入回收站'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
+  if (event.target.closest('[data-batch-restore]')) { const ids = Array.from(appState.selected); persistRestore(ids).then(() => { appState.selected.clear(); showToast('已恢复所选公告'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
+  const restoreNotice = event.target.closest('[data-restore-notice]');
+  if (restoreNotice) { persistRestore([restoreNotice.dataset.restoreNotice]).then(() => { showToast('公告已恢复到公告库'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
   const openFile = event.target.closest('[data-open-file]');
   if (openFile) {
     if (!backendOnline) { showToast('请先启动后端'); return; }
@@ -673,6 +689,7 @@ document.addEventListener('click', event => {
   const drawerMark = event.target.closest('[data-drawer-mark]');
   if (drawerMark && appState.detailId) { const mark = drawerMark.dataset.drawerMark; persistMark([appState.detailId], mark).then(() => { closeDetail(); showToast('业务标记已更新'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
   if (event.target.closest('[data-drawer-delete]')) { const id = appState.detailId; persistDelete([id]).then(() => { closeDetail(); showToast('公告已移入回收站，可在回收站恢复'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
+  if (event.target.closest('[data-drawer-restore]')) { const id = appState.detailId; persistRestore([id]).then(() => { closeDetail(); showToast('公告已恢复到公告库'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
   const reparse = event.target.closest('[data-reparse-notice]');
   if (reparse && appState.detailId) { const noticeId = appState.detailId; apiFetch(`/api/notices/${noticeId}/reparse`, { method: 'POST' }).then(result => { showToast(result.message); void watchReparse(result.task_id, noticeId); }).catch(error => showToast(error.message)); return; }
   const newKeyword = event.target.closest('[data-new-keyword]');

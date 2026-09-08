@@ -31,6 +31,7 @@ from . import reparse_tasks
 from .maintenance import activity
 from .migration import adopt_storage, migrate_storage
 from .update_checker import UpdateCheckError, check_update
+from .manual_verification import ManualVerificationError, close_verification, complete_verification, open_verification
 
 
 APP_VERSION = "1.1.0"
@@ -316,6 +317,65 @@ def site_health_check(site_id: int) -> dict[str, Any]:
         connection.execute("UPDATE sites SET health_status=?,health_message=?,last_checked_at=? WHERE id=?", ("healthy" if result["ok"] else "unhealthy", result["message"], now_iso(), site_id))
         log_event(connection, "site.health", f"{site['name']}：{result['message']}", "INFO" if result["ok"] else "WARNING")
     return result
+
+
+@app.post("/api/sites/{site_id}/manual-verification/open")
+def open_site_verification(site_id: int) -> dict[str, Any]:
+    validate_id(site_id, "平台")
+    with get_db() as connection:
+        site = connection.execute("SELECT id,base_url FROM sites WHERE id=?", (site_id,)).fetchone()
+    if not site:
+        raise HTTPException(status_code=404, detail="平台不存在")
+    try:
+        return open_verification(site_id, site["base_url"], settings.data_dir / "browser_sessions")
+    except ManualVerificationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/sites/{site_id}/manual-verification/complete")
+def complete_site_verification(site_id: int) -> dict[str, Any]:
+    validate_id(site_id, "平台")
+    with get_db() as connection:
+        site = connection.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+    if not site:
+        raise HTTPException(status_code=404, detail="平台不存在")
+    try:
+        cookie = complete_verification(site_id)
+        adapter = make_adapter(site["code"], site["base_url"], session_cookie=cookie)
+        try:
+            result = adapter.health_check()
+        finally:
+            adapter.close()
+        if not result["ok"]:
+            raise ManualVerificationError(f"验证后仍无法采集：{result['message']}")
+        with get_db() as connection:
+            account = connection.execute(
+                "SELECT id FROM site_accounts WHERE site_id=? AND alias='人工验证会话' ORDER BY id LIMIT 1", (site_id,)
+            ).fetchone()
+            timestamp = now_iso()
+            if account:
+                account_id = int(account["id"])
+                connection.execute(
+                    "UPDATE site_accounts SET credential_ref=?,session_status='verified',last_login_at=?,status_reason='人工验证成功',enabled=1 WHERE id=?",
+                    (cookie, timestamp, account_id),
+                )
+            else:
+                cursor = connection.execute(
+                    "INSERT INTO site_accounts(site_id,alias,login_mode,credential_ref,session_status,last_login_at,status_reason,enabled,created_at) VALUES(?,?,'manual_session',?,'verified',?,'人工验证成功',1,?)",
+                    (site_id, "人工验证会话", cookie, timestamp, timestamp),
+                )
+                account_id = int(cursor.lastrowid)
+            connection.execute("UPDATE crawl_jobs SET account_id=? WHERE site_id=?", (account_id, site_id))
+            connection.execute(
+                "UPDATE sites SET health_status='healthy',health_message=?,last_checked_at=? WHERE id=?",
+                ("人工验证成功，公开公告列表正常", timestamp, site_id),
+            )
+            log_event(connection, "site.manual_verify", f"{site['name']}：人工验证成功，会话已绑定采集任务")
+        return {"ok": True, "message": "人工验证成功，已绑定该平台采集任务，可立即采集"}
+    except ManualVerificationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        close_verification(site_id)
 
 
 @app.post("/api/sites/{site_id}/accounts")

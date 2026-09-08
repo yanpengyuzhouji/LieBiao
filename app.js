@@ -440,7 +440,7 @@ function renderJobs() {
 }
 
 function renderLivePlatforms() {
-  return `<section class="panel-card"><div class="panel-head"><div><h3>平台与账号 <span style="color:#9da7b7;font-family:'DM Mono';font-size:10px">${appState.sites.length}</span></h3><p>平台均按公开采集模式运行，不需要账号；遇到平台安全验证时会明确记为失败。</p></div></div><div class="panel-body"><table class="platform-table"><thead><tr><th>平台</th><th>采集模式</th><th>连通状态</th><th>最近检查（北京时间）</th><th>操作</th></tr></thead><tbody>${appState.sites.map(site => `<tr><td><div class="platform-name"><span class="platform-logo ${site.code === 'csg' ? 'green' : ['sgcc', 'epec', 'cdt'].includes(site.code) ? 'orange' : ''}">${esc(site.name.slice(0, 1))}</span>${esc(site.name)}</div></td><td>公开公告（免登录）</td><td><span class="account-status">${esc(site.health_status === 'healthy' ? '正常' : site.health_status === 'unhealthy' ? '异常' : '未检查')}</span></td><td>${esc(beijingDateTime(site.last_checked_at))}</td><td><button class="batch-action" data-health-site="${site.id}">健康检查</button></td></tr>`).join('')}</tbody></table></div></section>`;
+  return `<section class="panel-card"><div class="panel-head"><div><h3>平台与账号 <span style="color:#9da7b7;font-family:'DM Mono';font-size:10px">${appState.sites.length}</span></h3><p>遇到平台安全验证时，可打开专用窗口人工完成验证，再回到这里保存会话。</p></div></div><div class="panel-body"><table class="platform-table"><thead><tr><th>平台</th><th>采集模式</th><th>连通状态</th><th>最近检查（北京时间）</th><th>操作</th></tr></thead><tbody>${appState.sites.map(site => `<tr><td><div class="platform-name"><span class="platform-logo ${site.code === 'csg' ? 'green' : ['sgcc', 'epec', 'cdt'].includes(site.code) ? 'orange' : ''}">${esc(site.name.slice(0, 1))}</span>${esc(site.name)}</div></td><td>公开公告（免登录）</td><td><span class="account-status">${esc(site.health_status === 'healthy' ? '正常' : site.health_status === 'unhealthy' ? '异常' : '未检查')}</span></td><td>${esc(beijingDateTime(site.last_checked_at))}</td><td><div class="row-actions-inline"><button class="batch-action" data-health-site="${site.id}">健康检查</button><button class="batch-action" data-open-verification="${site.id}">打开人工验证</button><button class="batch-action" data-complete-verification="${site.id}">验证完成</button></div></td></tr>`).join('')}</tbody></table></div></section>`;
 }
 
 function renderPlatforms() {
@@ -693,6 +693,10 @@ document.addEventListener('click', event => {
   if (runJob) { runJobFromUi(runJob.dataset.runJob); return; }
   const healthSite = event.target.closest('[data-health-site]');
   if (healthSite) { apiFetch(`/api/sites/${healthSite.dataset.healthSite}/health-check`, { method: 'POST' }).then(result => { showToast(result.message || `健康检查：${result.ok ? '正常' : '异常'}`); return loadManagementData('platforms'); }).catch(error => showToast(error.message)); return; }
+  const openVerification = event.target.closest('[data-open-verification]');
+  if (openVerification) { apiFetch(`/api/sites/${openVerification.dataset.openVerification}/manual-verification/open`, { method: 'POST' }).then(result => showToast(result.message)).catch(error => showToast(error.message)); return; }
+  const completeVerification = event.target.closest('[data-complete-verification]');
+  if (completeVerification) { completeVerification.disabled = true; apiFetch(`/api/sites/${completeVerification.dataset.completeVerification}/manual-verification/complete`, { method: 'POST' }).then(result => { showToast(result.message); return loadManagementData('platforms'); }).catch(error => showToast(error.message)).finally(() => { completeVerification.disabled = false; }); return; }
   if (event.target.closest('[data-refresh-management]')) { loadManagementData(appState.view); return; }
   if (event.target.closest('#open-import') || event.target.closest('#open-import-secondary')) { openImport(); return; }
   const fileTrigger = event.target.closest('[data-trigger-file]');

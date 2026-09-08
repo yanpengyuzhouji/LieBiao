@@ -44,6 +44,8 @@ Windows 上建议使用 `py run_app.py` 启动。打包时在 Windows 开发机�
 
 已接入南方电网、ECP2.0、国网交易专区、中国石化物资、中国华能和大唐集团。中国石化支持公开列表与正文采集；华能支持公开详情解析；华能、大唐列表若触发平台安全验证会明确失败，不会把验证页误入库。验证方法：
 
+“平台与账号”页面可打开独立的 Edge 人工验证窗口；验证完成后，系统在本机读取该平台会话、执行真实列表检查，并把有效会话绑定到该平台采集任务。会话 Cookie 仅保存在本机数据库，不写入日志。
+
 ```bash
 python -m unittest discover -s tests -v
 python scripts/live_acceptance.py

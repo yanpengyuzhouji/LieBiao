@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+import sqlite3
 
 from backend.adapters import NoticeData
 from backend.config import settings
@@ -11,6 +12,21 @@ from backend.service import ingest_notice_data, rebuild_keyword_group_analysis
 
 
 class SeedBehaviorTests(unittest.TestCase):
+    def test_one_current_extracted_document_per_attachment(self) -> None:
+        original_data_dir = settings.data_dir
+        with tempfile.TemporaryDirectory() as folder:
+            settings.data_dir = Path(folder)
+            try:
+                init_db()
+                with get_db() as connection:
+                    notice_id = ingest_notice_data(connection, 1, NoticeData("unique-doc", "测试公告", "https://example.com/unique-doc", "正文"), download_attachments=False)
+                    attachment_id = connection.execute("INSERT INTO attachments(notice_id,name,status,created_at) VALUES(?,?,?,datetime('now'))", (notice_id, "a.docx", "stored")).lastrowid
+                    connection.execute("INSERT INTO extracted_documents(attachment_id,status,created_at,updated_at) VALUES(?,?,datetime('now'),datetime('now'))", (attachment_id, "parsed"))
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        connection.execute("INSERT INTO extracted_documents(attachment_id,status,created_at,updated_at) VALUES(?,?,datetime('now'),datetime('now'))", (attachment_id, "parsed"))
+            finally:
+                settings.data_dir = original_data_dir
+
     def test_unmatched_crawl_candidate_is_not_persisted(self) -> None:
         original_data_dir = settings.data_dir
         with tempfile.TemporaryDirectory() as folder:

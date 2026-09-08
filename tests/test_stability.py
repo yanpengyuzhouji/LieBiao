@@ -8,7 +8,8 @@ from pathlib import Path
 from backend.adapters import NoticeData
 from backend.config import settings
 from backend.db import get_db, init_db, now_iso
-from backend.service import create_attachment, ingest_notice_data, refresh_notice_analysis, try_create_run
+from backend.main import list_notices
+from backend.service import attachment_tree_needs_reparse, create_attachment, find_site, ingest_notice_data, refresh_notice_analysis, try_create_run
 from backend.stabilization_migration import migrate_stabilization_schema
 from backend.storage import save_raw_html
 
@@ -82,6 +83,42 @@ class StabilityIntegrationTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertTrue((settings.data_dir / first).exists())
         self.assertTrue((settings.data_dir / second).exists())
+
+    def test_manual_import_promotes_existing_crawl_notice(self) -> None:
+        with get_db() as connection:
+            notice = NoticeData("manual-1", "手工导入公告", "https://www.bidding.csg.cn/zbgg/manual-1.jhtml", "正文")
+            notice_id = ingest_notice_data(connection, 1, notice, source_type="crawl", download_attachments=False)
+            ingest_notice_data(connection, 1, notice, source_type="url_import", download_attachments=False)
+            self.assertEqual(connection.execute("SELECT source_type FROM notices WHERE id=?", (notice_id,)).fetchone()["source_type"], "url_import")
+
+    def test_cached_archive_retries_failed_or_legacy_doc_children(self) -> None:
+        with get_db() as connection:
+            notice_id = ingest_notice_data(connection, 1, NoticeData("cache-1", "缓存公告", "https://example.com/cache-1", "正文"), download_attachments=False)
+            parent = create_attachment(connection, notice_id, "附件.zip", "https://example.com/a.zip", "extracted")
+            connection.execute("UPDATE attachments SET parse_status='parsed' WHERE id=?", (parent,))
+            child = create_attachment(connection, notice_id, "旧文件.doc", None, "stored", parent)
+            connection.execute("UPDATE attachments SET parse_status='unsupported' WHERE id=?", (child,))
+            self.assertTrue(attachment_tree_needs_reparse(connection, parent))
+            connection.execute("UPDATE attachments SET parse_status='parsed' WHERE id=?", (child,))
+            self.assertFalse(attachment_tree_needs_reparse(connection, parent))
+
+    def test_site_matching_rejects_lookalike_and_unknown_hosts(self) -> None:
+        with get_db() as connection:
+            self.assertIsNotNone(find_site(connection, "https://www.bidding.csg.cn/zbgg/1.jhtml"))
+            self.assertIsNone(find_site(connection, "https://www.bidding.csg.cn.example.com/zbgg/1.jhtml"))
+            self.assertIsNone(find_site(connection, "https://example.com/notice"))
+
+    def test_only_unmatched_notice_with_parse_issue_is_shown_in_recovery_filter(self) -> None:
+        with get_db() as connection:
+            parsed_id = ingest_notice_data(connection, 1, NoticeData("hidden-1", "完整未命中公告", "https://example.com/hidden-1", "普通正文"), source_type="crawl", download_attachments=False)
+            issue_id = ingest_notice_data(connection, 1, NoticeData("hidden-2", "异常未命中公告", "https://example.com/hidden-2", "普通正文"), source_type="crawl", download_attachments=False)
+            create_attachment(connection, issue_id, "待解析附件.doc", "https://example.com/pending.doc")
+        self.assertEqual(list_notices(q="未命中", limit=10, offset=0)["total"], 0)
+        recovered = list_notices(q="未命中", only_matched=False, only_unmatched=True, limit=10, offset=0)
+        self.assertEqual(recovered["total"], 1)
+        self.assertEqual(recovered["category_counts"]["unmatched"], 1)
+        self.assertEqual(recovered["items"][0]["id"], str(issue_id))
+        self.assertNotEqual(recovered["items"][0]["id"], str(parsed_id))
 
 
 if __name__ == "__main__":

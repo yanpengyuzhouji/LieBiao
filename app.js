@@ -3,7 +3,7 @@ const notices = [];
 const appState = {
   view: 'notices', tab: 'all', query: '', platform: 'all', mark: 'all', attachment: 'all', selected: new Set(), detailId: null, detailTab: 'info', importTab: 'url',
   keywordGroups: [], jobs: [], sites: [], logs: [], runs: [], dashboard: null, scheduler: null, config: null, page: 1, pageSize: 10, totalNotices: 0,
-  noticeCounts: { all: 0, pending: 0, focus: 0, issues: 0 }
+  noticeCounts: { all: 0, pending: 0, focus: 0, issues: 0, unmatched: 0 }
 };
 
 let backendOnline = false;
@@ -74,12 +74,16 @@ async function loadBackendNotices(resetPage = true) {
     attachment: appState.attachment,
     only_issues: String(appState.tab === 'issues')
   });
+  if (appState.tab === 'unmatched') {
+    params.set('only_matched', 'false');
+    params.set('only_unmatched', 'true');
+  }
   try {
     const payload = await apiFetch(`/api/notices?${params.toString()}`);
     backendOnline = true;
     notices.splice(0, notices.length, ...(payload.items || []).map(normalizeBackendNotice));
     appState.totalNotices = Number(payload.total || 0);
-    appState.noticeCounts = payload.category_counts || { all: appState.totalNotices, pending: 0, focus: 0, issues: 0 };
+    appState.noticeCounts = payload.category_counts || { all: appState.totalNotices, pending: 0, focus: 0, issues: 0, unmatched: 0 };
     const pageCount = Math.max(1, Math.ceil(appState.totalNotices / appState.pageSize));
     if (appState.page > pageCount) {
       appState.page = pageCount;
@@ -100,7 +104,7 @@ async function loadBackendNotices(resetPage = true) {
     backendOnline = false;
     notices.splice(0, notices.length);
     appState.totalNotices = 0;
-    appState.noticeCounts = { all: 0, pending: 0, focus: 0, issues: 0 };
+    appState.noticeCounts = { all: 0, pending: 0, focus: 0, issues: 0, unmatched: 0 };
     const count = $('#notice-nav-count');
     if (count) count.textContent = '0';
     const sync = $('#last-sync-text');
@@ -339,12 +343,14 @@ function renderNotices() {
   const pending = counts.pending;
   const focus = counts.focus;
   const issues = counts.issues;
+  const unmatched = counts.unmatched || 0;
   return `${renderStats()}${renderDataStrip()}<div class="toolbar-card">
     <div class="filter-tabs">
       <button class="filter-tab ${appState.tab === 'all' ? 'active' : ''}" data-filter-tab="all">全部 <span class="tab-number">${total}</span></button>
       <button class="filter-tab ${appState.tab === 'pending' ? 'active' : ''}" data-filter-tab="pending">待确认 <span class="tab-number">${pending}</span></button>
       <button class="filter-tab ${appState.tab === 'focus' ? 'active' : ''}" data-filter-tab="focus">重点关注 <span class="tab-number">${focus}</span></button>
       <button class="filter-tab ${appState.tab === 'issues' ? 'active' : ''}" data-filter-tab="issues">解析异常 <span class="tab-number">${issues}</span></button>
+      <button class="filter-tab ${appState.tab === 'unmatched' ? 'active' : ''}" data-filter-tab="unmatched" title="未命中关键词且存在解析异常或待处理附件">可能漏匹配 <span class="tab-number">${unmatched}</span></button>
     </div>
     <div class="filter-row">
       <label class="search-box"><span class="search-icon">⌕</span><input id="notice-search" value="${esc(appState.query)}" placeholder="搜索标题、项目编号或需求单位" /></label>
@@ -675,7 +681,7 @@ document.addEventListener('click', event => {
   if (event.target.closest('[data-close-config]')) { closeConfig(); return; }
   const importTab = event.target.closest('[data-import-tab]');
   if (importTab) { appState.importTab = importTab.dataset.importTab; $$('.import-tab').forEach(tab => tab.classList.toggle('active', tab === importTab)); $$('.import-panel').forEach(panel => panel.classList.toggle('active', panel.dataset.importPanel === appState.importTab)); return; }
-  if (event.target.closest('#confirm-import')) { const input = $('#url-input'); const urls = input ? input.value.split(/\n+/).map(value => value.trim()).filter(Boolean) : []; closeImport(); if (urls.length && backendOnline) { apiFetch('/api/imports/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ urls }) }).then(result => { showToast(`导入完成：新增 ${result.created} 条，失败 ${result.failed} 条`); return loadBackendNotices(); }).catch(error => showToast(error.message)); } else { showToast(urls.length ? '已完成导入预检，等待确认入库' : '请先输入至少一个公告 URL'); } return; }
+  if (event.target.closest('#confirm-import')) { const input = $('#url-input'); const urls = input ? input.value.split(/\n+/).map(value => value.trim()).filter(Boolean) : []; closeImport(); if (urls.length && backendOnline) { apiFetch('/api/imports/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ urls }) }).then(result => { showToast(`导入完成：新增 ${result.created} 条，更新 ${result.updated} 条，失败 ${result.failed} 条`); return loadBackendNotices(); }).catch(error => showToast(error.message)); } else { showToast(urls.length ? '已完成导入预检，等待确认入库' : '请先输入至少一个公告 URL'); } return; }
   const toggle = event.target.closest('.toggle');
   if (toggle) { toggle.classList.toggle('on'); const row = toggle.closest('.config-row'); const copy = row && row.querySelector('.config-copy'); if (copy) copy.classList.add('updated'); showToast('匹配设置已更新'); return; }
   const toastButton = event.target.closest('[data-toast]');

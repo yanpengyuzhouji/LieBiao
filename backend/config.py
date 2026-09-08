@@ -58,7 +58,7 @@ class Settings:
     config_dir: Path = default_config_dir()
     data_dir: Path = default_data_dir()
     host: str = os.getenv("LIEBIAO_HOST", "127.0.0.1")
-    port: int = int(os.getenv("LIEBIAO_PORT", "8090"))
+    port: int = int(os.getenv("LIEBIAO_PORT", "8091"))
     max_attachment_mb: int = int(os.getenv("LIEBIAO_MAX_ATTACHMENT_MB", "500"))
     max_archive_mb: int = int(os.getenv("LIEBIAO_MAX_ARCHIVE_MB", "500"))
     max_expanded_mb: int = int(os.getenv("LIEBIAO_MAX_EXPANDED_MB", "2048"))

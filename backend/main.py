@@ -32,7 +32,8 @@ from .maintenance import activity
 from .migration import migrate_storage
 
 
-app = FastAPI(title="猎标 V1 API", version="1.0.0", docs_url="/api/docs", redoc_url=None)
+APP_VERSION = "1.0.2"
+app = FastAPI(title="猎标 V1 API", version=APP_VERSION, docs_url="/api/docs", redoc_url=None)
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 
 
@@ -173,7 +174,7 @@ def shutdown() -> None:
 def health() -> dict[str, Any]:
     with get_db() as connection:
         connection.execute("SELECT 1").fetchone()
-    return {"ok": True, "service": "lieBiao", "version": "1.0.0", "timezone": "Asia/Shanghai", "timezone_label": "北京时间（UTC+08:00）", "server_time": beijing_time(now_iso()), "storage_root": str(settings.data_dir), "database": str(settings.db_path)}
+    return {"ok": True, "service": "lieBiao", "version": APP_VERSION, "timezone": "Asia/Shanghai", "timezone_label": "北京时间（UTC+08:00）", "server_time": beijing_time(now_iso()), "storage_root": str(settings.data_dir), "database": str(settings.db_path)}
 
 
 @app.get("/api/settings/storage")
@@ -539,13 +540,18 @@ def dashboard() -> dict[str, Any]:
 
 
 @app.get("/api/notices")
-def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: str = "all", attachment: str = "all", only_issues: bool = False, only_matched: bool = True, include_deleted: bool = False, limit: int = Query(default=10, ge=1, le=100), offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
+def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: str = "all", attachment: str = "all", only_issues: bool = False, only_matched: bool = True, only_unmatched: bool = False, include_deleted: bool = False, limit: int = Query(default=10, ge=1, le=100), offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
+    possible_missed_match = """n.source_type='crawl'
+        AND NOT EXISTS (SELECT 1 FROM keyword_hits mh WHERE mh.notice_id=n.id AND mh.is_negative=0)
+        AND (n.ingest_status IN ('failed','partial') OR EXISTS (
+            SELECT 1 FROM attachments ma WHERE ma.notice_id=n.id
+            AND (ma.parse_status IN ('failed','unsupported','ocr_pending','pending')
+                 OR ma.status IN ('failed','needs_tool','not_downloaded'))
+        ))"""
     clauses = ["1=1"]
     params: list[Any] = []
     if not include_deleted:
         clauses.append("n.deleted_at IS NULL")
-    if only_matched:
-        clauses.append("(n.source_type<>'crawl' OR EXISTS (SELECT 1 FROM keyword_hits mh WHERE mh.notice_id=n.id AND mh.is_negative=0))")
     if q:
         clauses.append("(n.title LIKE ? OR n.project_number LIKE ? OR n.demand_unit LIKE ? OR n.summary LIKE ? OR EXISTS (SELECT 1 FROM keyword_hits qh WHERE qh.notice_id=n.id AND qh.is_negative=0 AND (qh.keyword LIKE ? OR qh.snippet LIKE ?)))")
         params.extend([f"%{q}%"] * 6)
@@ -555,6 +561,12 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
         clauses.append("EXISTS (SELECT 1 FROM attachments af WHERE af.notice_id=n.id)")
     elif attachment == "no":
         clauses.append("NOT EXISTS (SELECT 1 FROM attachments af WHERE af.notice_id=n.id)")
+    scope_clauses = list(clauses)
+    scope_params = list(params)
+    if only_unmatched:
+        clauses.append(possible_missed_match)
+    elif only_matched:
+        clauses.append("(n.source_type<>'crawl' OR EXISTS (SELECT 1 FROM keyword_hits mh WHERE mh.notice_id=n.id AND mh.is_negative=0))")
     # Category totals use the same search/platform/attachment scope, but are
     # independent from the currently selected category.
     facet_clauses = list(clauses)
@@ -579,6 +591,10 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
             FROM notices n LEFT JOIN sites s ON s.id=n.site_id WHERE {facet_where}""",
             facet_params,
         ).fetchone()
+        unmatched_count = connection.execute(
+            f"SELECT COUNT(*) FROM notices n LEFT JOIN sites s ON s.id=n.site_id WHERE {' AND '.join(scope_clauses)} AND {possible_missed_match}",
+            scope_params,
+        ).fetchone()[0]
         items = [frontend_notice(connection, row) for row in rows]
     return {
         "items": items, "total": total, "limit": limit, "offset": offset,
@@ -587,6 +603,7 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
             "pending": int(category_counts["pending_count"] or 0),
             "focus": int(category_counts["focus_count"] or 0),
             "issues": int(category_counts["issues_count"] or 0),
+            "unmatched": int(unmatched_count or 0),
         },
     }
 
@@ -824,7 +841,7 @@ def latest_reparse_status(notice_id: int):
 
 @app.post("/api/imports/url")
 def import_urls(payload: UrlImportRequest) -> dict[str, Any]:
-    results = {"created": 0, "failed": 0, "items": []}
+    results = {"created": 0, "updated": 0, "failed": 0, "items": []}
     with get_db() as connection:
         cursor = connection.execute("INSERT INTO import_batches(source_type,source_name,total_count,status,created_at) VALUES(?,?,?,?,?)", ("url", "批量 URL 导入", len(payload.urls), "running", now_iso()))
         batch_id = int(cursor.lastrowid)
@@ -833,13 +850,14 @@ def import_urls(payload: UrlImportRequest) -> dict[str, Any]:
         if not source_url.startswith(("http://", "https://")):
             results["failed"] += 1; results["items"].append({"url": source_url, "status": "格式错误", "error": "仅支持 http/https URL"}); continue
         try:
-            notice_id = ingest_url(source_url, payload.site_code)
-            results["created"] += 1; results["items"].append({"url": source_url, "status": "已入库", "notice_id": notice_id})
+            notice_id, created = ingest_url(source_url, payload.site_code)
+            key = "created" if created else "updated"
+            results[key] += 1; results["items"].append({"url": source_url, "status": "新增入库" if created else "更新已有公告", "notice_id": notice_id})
         except Exception as exc:
             results["failed"] += 1; results["items"].append({"url": source_url, "status": "失败", "error": str(exc)})
     with get_db() as connection:
-        connection.execute("UPDATE import_batches SET status=?,created_count=?,error_count=? WHERE id=?", ("completed" if not results["failed"] else "partial", results["created"], results["failed"], batch_id))
-        log_event(connection, "import.url", f"URL 导入完成：成功 {results['created']} 条，失败 {results['failed']} 条")
+        connection.execute("UPDATE import_batches SET status=?,created_count=?,updated_count=?,error_count=? WHERE id=?", ("completed" if not results["failed"] else "partial", results["created"], results["updated"], results["failed"], batch_id))
+        log_event(connection, "import.url", f"URL 导入完成：新增 {results['created']} 条，更新 {results['updated']} 条，失败 {results['failed']} 条")
     return {"batch_id": batch_id, **results}
 
 

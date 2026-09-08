@@ -71,8 +71,8 @@ def parse_notice_datetime(value: str | None) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
-        match = re.search(
-            r"(20\d{2})[-.]?(\d{1,2})[-.]?(\d{1,2})(?:\D+(\d{1,2}):(\d{2})(?::(\d{2}))?)?",
+        match = re.fullmatch(
+            r"(?:发布时间|发布日期|公告时间|发布于)?\s*:?\s*(20\d{2})[-.]?(\d{1,2})[-.]?(\d{1,2})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\s*",
             normalized,
         )
         if not match:
@@ -215,15 +215,18 @@ def format_bytes(size: int) -> str:
 
 
 def find_site(connection, source_url: str, preferred_code: str | None = None):
+    hostname = (urlparse(source_url).hostname or "").lower().rstrip(".")
+    def matches(row) -> bool:
+        site_hostname = (urlparse(row["base_url"]).hostname or "").lower().rstrip(".")
+        return bool(site_hostname and (hostname == site_hostname or hostname.endswith("." + site_hostname)))
     if preferred_code:
         row = connection.execute("SELECT * FROM sites WHERE code=?", (preferred_code,)).fetchone()
-        if row:
+        if row and matches(row):
             return row
-    hostname = urlparse(source_url).hostname or ""
     for row in connection.execute("SELECT * FROM sites").fetchall():
-        if urlparse(row["base_url"]).hostname and urlparse(row["base_url"]).hostname in hostname:
+        if matches(row):
             return row
-    return connection.execute("SELECT * FROM sites WHERE code='csg'").fetchone()
+    return None
 
 
 def extract_field(patterns: list[str], text: str) -> str | None:
@@ -272,6 +275,17 @@ def create_attachment(connection, notice_id: int, name: str, source_url: str | N
         (notice_id, parent_id, name, source_url, status, timestamp),
     )
     return int(cursor.lastrowid)
+
+
+def attachment_tree_needs_reparse(connection, attachment_id: int) -> bool:
+    return connection.execute(
+        """WITH RECURSIVE tree(id,name,parse_status) AS (
+        SELECT id,name,parse_status FROM attachments WHERE id=?
+        UNION ALL SELECT a.id,a.name,a.parse_status FROM attachments a JOIN tree t ON a.parent_attachment_id=t.id)
+        SELECT 1 FROM tree WHERE parse_status IN ('failed','pending')
+        OR (parse_status='unsupported' AND lower(name) LIKE '%.doc') LIMIT 1""",
+        (attachment_id,),
+    ).fetchone() is not None
 
 
 def save_streamed_attachment(adapter: BaseAdapter, notice_id: int, attachment_id: int, name: str, source_url: str) -> tuple[Path, int, str]:
@@ -440,7 +454,8 @@ def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapte
             connection.execute("INSERT INTO notice_versions(notice_id,version_no,raw_html_path,body_text,published_at,content_fingerprint,captured_at) VALUES(?,?,?,?,?,?,?)", (notice_id, version, raw_path, data.body_text, data.published_at, fingerprint, timestamp))
         else:
             raw_path = None
-        connection.execute("UPDATE notices SET title=?,notice_type=?,published_at=?,opening_at=?,content_fingerprint=?,current_version=?,deleted_at=NULL,ingest_status='detail_collected',updated_at=? WHERE id=?", (data.title, data.notice_type, data.published_at, data.opening_at, fingerprint, version, timestamp, notice_id))
+        effective_source_type = existing["source_type"] if source_type == "crawl" else source_type
+        connection.execute("UPDATE notices SET title=?,notice_type=?,published_at=?,opening_at=?,source_type=?,content_fingerprint=?,current_version=?,deleted_at=NULL,ingest_status='detail_collected',updated_at=? WHERE id=?", (data.title, data.notice_type, data.published_at, data.opening_at, effective_source_type, fingerprint, version, timestamp, notice_id))
     else:
         cursor = connection.execute("INSERT INTO notices(site_id,external_id,source_type,source_url,title,notice_type,published_at,opening_at,ingest_status,content_fingerprint,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (site_id, data.external_id, source_type, data.url, data.title, data.notice_type, data.published_at, data.opening_at, "detail_collected", fingerprint, timestamp, timestamp))
         notice_id = int(cursor.lastrowid)
@@ -461,7 +476,6 @@ def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapte
     connection.execute("UPDATE notices SET summary=?,ingest_status='attachments_processing',updated_at=? WHERE id=?", (summary, timestamp, notice_id))
     # Release metadata writes before potentially slow network and parsing work.
     connection.commit()
-    attachment_sources: list[dict[str, str]] = []
     if adapter and download_attachments:
         for item in data.attachments:
             attachment_id = create_attachment(connection, notice_id, item.name, item.url, "downloading")
@@ -471,11 +485,15 @@ def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapte
                 if saved["relative_path"] and saved["status"] in ("stored", "extracted"):
                     saved_path = absolute_from_relative(saved["relative_path"])
                     if saved_path.is_file() and sha256_file(saved_path) == saved["sha256"]:
+                        if attachment_tree_needs_reparse(connection, attachment_id):
+                            process_local_attachment(connection, notice_id, attachment_id, saved_path, item.name)
+                        else:
+                            continue
                         continue
                 path, size, digest = save_streamed_attachment(adapter, notice_id, attachment_id, item.name, item.url)
                 connection.execute("UPDATE attachments SET relative_path=?,mime_type=?,sha256=?,size_bytes=?,status='stored' WHERE id=?", (relative_to_data(path), file_mime(path), digest, size, attachment_id))
                 connection.commit()
-                attachment_sources.extend(process_local_attachment(connection, notice_id, attachment_id, path, item.name))
+                process_local_attachment(connection, notice_id, attachment_id, path, item.name)
             except Exception as exc:
                 connection.execute("UPDATE attachments SET status='failed',parse_status='failed',error_message=? WHERE id=?", (f"下载失败：{exc}", attachment_id))
                 log_event(connection, "attachment.download", f"{item.name}：{exc}", "WARNING", notice_id=notice_id)
@@ -496,11 +514,11 @@ def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapte
     attachment_rows = connection.execute("SELECT status,parse_status FROM attachments WHERE notice_id=?", (notice_id,)).fetchall()
     has_attachment_issue = any(row["status"] in ("failed", "needs_tool") or row["parse_status"] in ("failed", "unsupported", "ocr_pending") for row in attachment_rows)
     connection.execute("UPDATE notices SET ingest_status=?,updated_at=? WHERE id=?", ("partial" if has_attachment_issue else "parsed", now_iso(), notice_id))
-    log_event(connection, "notice.ingest", f"公告入库：{data.title}", notice_id=notice_id)
+    log_event(connection, "notice.ingest", f"公告{'新增入库' if created_new else '重复更新'}：{data.title}", notice_id=notice_id)
     return notice_id
 
 
-def ingest_url(source_url: str, preferred_site: str | None = None) -> int:
+def ingest_url(source_url: str, preferred_site: str | None = None) -> tuple[int, bool]:
     with get_db() as connection:
         site = find_site(connection, source_url, preferred_site)
         if not site:
@@ -508,7 +526,9 @@ def ingest_url(source_url: str, preferred_site: str | None = None) -> int:
         adapter = make_adapter(site["code"], site["base_url"])
         try:
             data = adapter.fetch_notice(source_url)
-            return ingest_notice_data(connection, site["id"], data, adapter, source_type="url_import")
+            existing = connection.execute("SELECT id FROM notices WHERE site_id IS ? AND (external_id=? OR source_url=?) ORDER BY id LIMIT 1", (site["id"], data.external_id, data.url)).fetchone()
+            notice_id = ingest_notice_data(connection, site["id"], data, adapter, source_type="url_import")
+            return notice_id, existing is None
         finally:
             adapter.close()
 
@@ -559,7 +579,7 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
             log_event(connection, "crawl.wait_manual", message, "WARNING", crawl_run_id=run_id)
         return
     adapter: BaseAdapter | None = None
-    discovered = details = filtered = attachments = parsed = failed = 0
+    discovered = details = created = duplicates = filtered = attachments = parsed = failed = 0
     reason = None
     def record_filter(title: str, rejection: str) -> None:
         nonlocal filtered
@@ -600,7 +620,7 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
         discovered = len(summaries)
         for summary in summaries:
             with get_db() as connection:
-                connection.execute("UPDATE crawl_runs SET heartbeat_at=?,discovered=?,detail_success=?,filtered_count=?,failed_count=? WHERE id=?", (now_iso(), discovered, details, filtered, failed, run_id))
+                connection.execute("UPDATE crawl_runs SET heartbeat_at=?,discovered=?,detail_success=?,created_count=?,duplicate_count=?,filtered_count=?,failed_count=? WHERE id=?", (now_iso(), discovered, details, created, duplicates, filtered, failed, run_id))
             if details >= job["max_notices"]:
                 break
             if summary.published_at:
@@ -640,11 +660,16 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
                 if not data.published_at:
                     data.published_at = effective_published_at
                 with get_db() as connection:
+                    existing = connection.execute("SELECT id FROM notices WHERE site_id IS ? AND (external_id=? OR source_url=?) ORDER BY id LIMIT 1", (job["site_id"], data.external_id, data.url)).fetchone()
                     notice_id = ingest_notice_data(connection, job["site_id"], data, adapter, download_attachments=bool(job["download_attachments"]), keyword_group_id=job["keyword_group_id"], filter_unmatched=True, crawl_job_id=job_id, crawl_run_id=run_id)
                 if notice_id is None:
                     filtered += 1
                     continue
                 details += 1
+                if existing is None:
+                    created += 1
+                else:
+                    duplicates += 1
                 attachments += len(data.attachments)
                 parsed += 1
             except Exception as exc:
@@ -666,12 +691,12 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
             status = "failed" if reason and not details else "partial" if reason else "completed"
             stop_reason = "failed" if status == "failed" else "target_reached" if details >= job["max_notices"] else "completed_with_errors" if reason else "candidate_exhausted"
             finished_at = now_iso()
-            connection.execute("UPDATE crawl_runs SET status=?,finished_at=?,heartbeat_at=?,stop_reason=?,discovered=?,detail_success=?,filtered_count=?,attachment_count=?,parsed_count=?,failed_count=?,failure_reason=? WHERE id=?", (status, finished_at, finished_at, stop_reason, discovered, details, filtered, attachments, parsed, failed, reason, run_id))
+            connection.execute("UPDATE crawl_runs SET status=?,finished_at=?,heartbeat_at=?,stop_reason=?,discovered=?,detail_success=?,created_count=?,duplicate_count=?,filtered_count=?,attachment_count=?,parsed_count=?,failed_count=?,failure_reason=? WHERE id=?", (status, finished_at, finished_at, stop_reason, discovered, details, created, duplicates, filtered, attachments, parsed, failed, reason, run_id))
             if preserve_schedule_anchor:
                 connection.execute("UPDATE crawl_jobs SET last_run_at=? WHERE id=?", (now_iso(), job_id))
             else:
                 connection.execute("UPDATE crawl_jobs SET last_run_at=?,schedule_anchor_at=NULL WHERE id=?", (now_iso(), job_id))
-            log_event(connection, "crawl.finish", f"采集批次完成：发现 {discovered} 条，命中入库 {details} 条，策略/关键词过滤 {filtered} 条，失败 {failed} 条", "WARNING" if reason else "INFO", crawl_run_id=run_id)
+            log_event(connection, "crawl.finish", f"采集批次完成：发现 {discovered} 条，关键词命中 {details} 条（首次新增 {created} 条，重复更新 {duplicates} 条），策略/关键词过滤 {filtered} 条，失败 {failed} 条", "WARNING" if reason else "INFO", crawl_run_id=run_id)
 
 
 def create_run(job_id: int) -> int:

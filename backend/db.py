@@ -139,6 +139,8 @@ CREATE TABLE IF NOT EXISTS crawl_runs (
     finished_at TEXT,
     discovered INTEGER NOT NULL DEFAULT 0,
     detail_success INTEGER NOT NULL DEFAULT 0,
+    created_count INTEGER NOT NULL DEFAULT 0,
+    duplicate_count INTEGER NOT NULL DEFAULT 0,
     filtered_count INTEGER NOT NULL DEFAULT 0,
     attachment_count INTEGER NOT NULL DEFAULT 0,
     parsed_count INTEGER NOT NULL DEFAULT 0,
@@ -288,6 +290,15 @@ def init_db() -> None:
         run_columns = {row["name"] for row in connection.execute("PRAGMA table_info(crawl_runs)").fetchall()}
         if "filtered_count" not in run_columns:
             connection.execute("ALTER TABLE crawl_runs ADD COLUMN filtered_count INTEGER NOT NULL DEFAULT 0")
+        if "created_count" not in run_columns:
+            connection.execute("ALTER TABLE crawl_runs ADD COLUMN created_count INTEGER NOT NULL DEFAULT 0")
+        if "duplicate_count" not in run_columns:
+            connection.execute("ALTER TABLE crawl_runs ADD COLUMN duplicate_count INTEGER NOT NULL DEFAULT 0")
+        extracted_cleanup = connection.execute("SELECT 1 FROM app_settings WHERE key=?", ("migration.extracted_documents.unique.v1",)).fetchone()
+        if not extracted_cleanup:
+            connection.execute("DELETE FROM extracted_documents WHERE id NOT IN (SELECT MAX(id) FROM extracted_documents GROUP BY attachment_id)")
+            connection.execute("INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,?)", ("migration.extracted_documents.unique.v1", "1", now_iso()))
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_extracted_documents_attachment_unique ON extracted_documents(attachment_id)")
         cleanup_marker = connection.execute("SELECT 1 FROM app_settings WHERE key=?", ("migration.keyword_hits.v1",)).fetchone()
         if not cleanup_marker:
             # 旧版本删除关键词组时把命中记录的外键置空；这些记录已经没有

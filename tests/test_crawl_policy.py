@@ -11,6 +11,7 @@ from backend.config import settings
 from backend.db import get_db, init_db
 from backend.service import (
     BEIJING_TZ,
+    ingest_notice_data,
     lookback_cutoff,
     notice_policy_rejection,
     parse_notice_datetime,
@@ -28,10 +29,13 @@ class CrawlPolicyUnitTests(unittest.TestCase):
     def test_source_dates_are_normalized_and_strictly_checked(self) -> None:
         cutoff = datetime(2026, 9, 3, 0, 0, tzinfo=BEIJING_TZ)
         self.assertEqual(parse_notice_datetime("2026年9月3日 08:30").strftime("%Y-%m-%d %H:%M"), "2026-09-03 08:30")
+        self.assertEqual(parse_notice_datetime("发布时间：2026年9月3日").strftime("%Y-%m-%d"), "2026-09-03")
         self.assertIsNone(notice_policy_rejection("2026-09-03 00:00", "招标公告", cutoff, {"招标公告"}))
         self.assertIn("早于回溯边界", notice_policy_rejection("2026-09-02 23:59", "招标公告", cutoff, {"招标公告"}) or "")
         self.assertIn("缺少可解析", notice_policy_rejection(None, "招标公告", cutoff, {"招标公告"}) or "")
         self.assertIn("不在任务范围", notice_policy_rejection("2026-09-04", "采购公告", cutoff, {"招标公告"}) or "")
+        self.assertIsNone(parse_notice_datetime("2026-09-03 invalid"))
+        self.assertIsNone(parse_notice_datetime("x2026-09-03y"))
 
 
 class CrawlPolicyIntegrationTests(unittest.TestCase):
@@ -79,12 +83,19 @@ class CrawlPolicyIntegrationTests(unittest.TestCase):
                         return None
 
                 with get_db() as connection:
-                    job = connection.execute("SELECT id FROM crawl_jobs ORDER BY id LIMIT 1").fetchone()
+                    job = connection.execute("SELECT id,keyword_group_id FROM crawl_jobs ORDER BY id LIMIT 1").fetchone()
                     self.assertIsNotNone(job)
                     job_id = int(job["id"])
                     connection.execute(
                         "UPDATE crawl_jobs SET lookback_days=1,categories_json=?,max_notices=10,interval_ms=200,retry_json=? WHERE id=?",
                         ('["招标公告"]', '{"max_attempts":2}', job_id),
+                    )
+                    ingest_notice_data(
+                        connection,
+                        1,
+                        NoticeData("recent", "recent 储能设备采购招标公告", "https://example.com/recent", "本项目采购储能设备，采用公开招标方式。", published_at=recent, notice_type="招标公告"),
+                        keyword_group_id=job["keyword_group_id"],
+                        download_attachments=False,
                     )
                 run_id = try_create_run(job_id)
                 self.assertIsNotNone(run_id)
@@ -107,6 +118,8 @@ class CrawlPolicyIntegrationTests(unittest.TestCase):
                 self.assertEqual(run["status"], "completed")
                 self.assertEqual(run["discovered"], 5)
                 self.assertEqual(run["detail_success"], 2)
+                self.assertEqual(run["created_count"], 1)
+                self.assertEqual(run["duplicate_count"], 1)
                 self.assertEqual(run["filtered_count"], 3)
                 self.assertEqual(run["failed_count"], 0)
                 self.assertEqual([row["external_id"] for row in stored], ["recent", "retry"])
@@ -115,6 +128,9 @@ class CrawlPolicyIntegrationTests(unittest.TestCase):
                 self.assertEqual(adapter.fetch_attempts["retry"], 2)
                 self.assertEqual(policy_logs, 3)
                 self.assertEqual(retry_logs, 1)
+                with get_db() as connection:
+                    finish = connection.execute("SELECT message FROM system_logs WHERE crawl_run_id=? AND event_type='crawl.finish'", (run_id,)).fetchone()["message"]
+                self.assertIn("关键词命中 2 条（首次新增 1 条，重复更新 1 条）", finish)
             finally:
                 settings.data_dir = original_data_dir
 

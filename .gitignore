@@ -16,6 +16,7 @@ dist/
 build/
 release/
 packaging/build/
+packaging/build-*/
 packaging/tools/
 
 # Databases, logs and temporary files anywhere

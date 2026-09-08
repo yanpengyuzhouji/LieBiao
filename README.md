@@ -17,6 +17,8 @@ python3 run_app.py
 
 Windows 上建议使用 `py run_app.py` 启动。打包时在 Windows 开发机执行 `packaging\\build_windows.bat`，产物位于 `dist\\LieBiao\\LieBiao.exe`。
 
+旧版 `.doc` 解析依赖目标电脑安装 Microsoft Word；`.docx`、`.xlsx` 和文本型 PDF 的解析组件已随程序打包。
+
 ### 采集范围约束
 
 “回溯天数”按北京时间自然日计算：`0` 表示仅当天，`1` 表示从昨天 00:00 起。采集会在列表元数据和详情数据两个阶段校验发布时间与公告类型；缺少可解析发布时间的记录不会自动入库，并会写入“策略过滤”日志。任务配置的请求间隔会覆盖列表、详情和附件请求，最多尝试次数也会在运行时强制执行。

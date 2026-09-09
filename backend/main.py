@@ -34,7 +34,7 @@ from .update_checker import update_monitor
 from .manual_verification import ManualVerificationError, close_verification, complete_verification, open_verification
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 app = FastAPI(title="猎标 V1 API", version=APP_VERSION, docs_url="/api/docs", redoc_url=None)
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 

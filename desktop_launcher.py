@@ -120,7 +120,27 @@ def main():
     tk.Label(window,text=f'数据目录：{settings.data_dir}',wraplength=500).pack(pady=8)
     url=f'http://127.0.0.1:{port}'
     tk.Button(window,text='打开系统',command=lambda:webbrowser.open(url)).pack(pady=8)
-    tray = WindowsTray(window, settings.data_dir, lambda: exit_app())
+    def open_updates():
+        target = 'https://github.com/yanpengyuzhouji/LieBiao/releases'
+        try:
+            with urllib.request.urlopen(f'{url}/api/update/check', timeout=2) as response:
+                release_url = json.load(response).get('release_url')
+            if isinstance(release_url, str) and release_url.startswith('https://'):
+                target = release_url
+            elif settings.update_url.startswith('https://'):
+                target = settings.update_url
+        except Exception:
+            if settings.update_url.startswith('https://'):
+                target = settings.update_url
+        webbrowser.open(target)
+
+    tray = WindowsTray(
+        window,
+        lambda: settings.data_dir,
+        lambda: exit_app(),
+        on_open_system=lambda: webbrowser.open(url),
+        on_open_updates=open_updates,
+    )
     tray_active = tray.start()
     if not tray_active:
         logging.warning('Windows notification-area icon is unavailable; using the taskbar window')

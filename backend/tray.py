@@ -9,10 +9,19 @@ from typing import Callable
 
 
 class WindowsTray:
-    def __init__(self, window, data_dir: Path, on_exit: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        window,
+        data_dir: Path | Callable[[], Path],
+        on_exit: Callable[[], None],
+        on_open_system: Callable[[], None] | None = None,
+        on_open_updates: Callable[[], None] | None = None,
+    ) -> None:
         self.window = window
         self.data_dir = data_dir
         self.on_exit = on_exit
+        self.on_open_system = on_open_system
+        self.on_open_updates = on_open_updates
         self._callback = None
         self._old_proc = 0
         self._nid = None
@@ -75,11 +84,18 @@ class WindowsTray:
 
         def menu_command(command: int) -> None:
             if command == MENU_OPEN:
-                show_window()
+                if self.on_open_system:
+                    self.on_open_system()
+                else:
+                    show_window()
             elif command == MENU_DATA:
-                os.startfile(str(self.data_dir))
+                data_dir = self.data_dir() if callable(self.data_dir) else self.data_dir
+                os.startfile(str(data_dir))
             elif command == MENU_RELEASES:
-                webbrowser.open(release_url)
+                if self.on_open_updates:
+                    self.on_open_updates()
+                else:
+                    webbrowser.open(release_url)
             elif command == MENU_EXIT:
                 self.on_exit()
 

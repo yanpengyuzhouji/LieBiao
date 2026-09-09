@@ -252,6 +252,20 @@ async function persistDelete(ids) {
   });
 }
 
+async function persistPermanentDelete(ids) {
+  const numericIds = ids.filter(id => /^\d+$/.test(String(id)));
+  if (backendOnline && numericIds.length) {
+    await apiFetch('/api/notices/batch-permanent-delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: numericIds.map(Number) }),
+    });
+  }
+  numericIds.forEach(id => {
+    const index = notices.findIndex(notice => String(notice.id) === String(id));
+    if (index >= 0) notices.splice(index, 1);
+  });
+}
+
 async function persistRestore(ids) {
   const numericIds = ids.filter(id => /^\d+$/.test(String(id)));
   if (backendOnline && numericIds.length) {
@@ -327,7 +341,7 @@ function noticeRow(notice) {
     <td><div class="hit-list">${hits}</div><div class="notice-meta" style="margin-top:5px">${esc(notice.bestHit)}</div></td>
     <td><div class="attachment-cell"><span class="attachment-icon">⌕</span><strong>${notice.attachments}</strong><span>个</span><small title="关键文件需人工标记">/ ${notice.keyFiles} 关键</small></div></td>
     <td><span class="status-tag status-${notice.status}">${notice.statusText}</span><div style="margin-top:5px"><span class="mark-tag mark-${notice.mark}">${notice.markText}</span></div></td>
-    <td><div class="row-actions"><button class="row-open" data-open-detail="${notice.id}" aria-label="查看详情">↗</button>${notice.isDeleted ? `<button class="batch-action" data-restore-notice="${notice.id}">恢复</button>` : '<button class="row-more" aria-label="更多操作">···</button>'}</div></td>
+    <td><div class="row-actions"><button class="row-open" data-open-detail="${notice.id}" aria-label="查看详情">↗</button>${notice.isDeleted ? `<button class="batch-action" data-restore-notice="${notice.id}">恢复</button><button class="batch-action danger" data-permanent-delete-notice="${notice.id}">删除</button>` : '<button class="row-more" aria-label="更多操作">···</button>'}</div></td>
   </tr>`;
 }
 
@@ -390,7 +404,8 @@ function renderNotices() {
       <label class="select-wrap"><select id="attachment-filter"><option value="all">附件情况</option><option value="yes" ${appState.attachment === 'yes' ? 'selected' : ''}>有附件</option><option value="no" ${appState.attachment === 'no' ? 'selected' : ''}>无附件</option></select></label>
       <button class="filter-more"><span>＋</span>更多筛选</button>
     </div>
-    <div class="batch-bar ${appState.selected.size ? 'visible' : ''}" id="batch-bar"><span>已选择 <strong id="selected-count">${appState.selected.size}</strong> 条</span><div class="batch-actions">${appState.tab === 'trash' ? '<button class="batch-action" data-batch-restore>批量恢复</button>' : '<button class="batch-action" data-batch-mark="relevant">标记为相关</button><button class="batch-action" data-batch-mark="focus">设为重点</button><button class="batch-action danger" data-batch-delete>批量删除</button>'}</div></div>
+    ${appState.tab === 'trash' ? '<div class="trash-actions"><span>永久删除会清理公告、附件、解析结果和文件哈希，仅保留防止再次采集的最小排除标记。</span><button class="batch-action" data-empty-trash>清空回收站</button></div>' : ''}
+    <div class="batch-bar ${appState.selected.size ? 'visible' : ''}" id="batch-bar"><span>已选择 <strong id="selected-count">${appState.selected.size}</strong> 条</span><div class="batch-actions">${appState.tab === 'trash' ? '<button class="batch-action" data-batch-restore>批量恢复</button><button class="batch-action danger" data-batch-permanent-delete>永久删除</button>' : '<button class="batch-action" data-batch-mark="relevant">标记为相关</button><button class="batch-action" data-batch-mark="focus">设为重点</button><button class="batch-action danger" data-batch-delete>批量删除</button>'}</div></div>
   </div>
   <div class="table-card"><div class="table-scroll"><table><thead><tr><th><input class="checkbox" id="select-all" type="checkbox" aria-label="全选" /></th><th style="width:27%">公告标题 / 来源</th><th>发布时间</th><th>开标时间</th><th>需求单位</th><th style="width:18%">项目摘要</th><th>关键词命中</th><th>附件</th><th>状态 / 标记</th><th></th></tr></thead><tbody id="notice-tbody"></tbody></table></div><div class="table-footer"><span>显示 <strong id="result-count">0</strong> 条结果，共 ${total} 条公告（每页 10 条）</span><div class="pagination" id="pagination-controls"></div></div></div>`;
 }
@@ -571,7 +586,7 @@ function detailFiles(notice) {
 function renderDrawer(notice) {
   const body = $('#drawer-body');
   const tabContent = appState.detailTab === 'info' ? detailInfo(notice) : appState.detailTab === 'evidence' ? detailEvidence(notice) : detailFiles(notice);
-  const actions = notice.isDeleted ? '<button class="button button-primary" data-drawer-restore>恢复到公告库</button>' : '<button class="button button-primary" data-drawer-mark="relevant">标记为相关</button><button class="button button-secondary" data-drawer-mark="focus">重点关注</button><button class="button button-secondary" data-reparse-notice>重新解析</button><button class="button button-danger" data-drawer-delete>软删除</button>';
+  const actions = notice.isDeleted ? '<button class="button button-primary" data-drawer-restore>恢复到公告库</button><button class="button button-danger" data-drawer-permanent-delete>永久删除</button>' : '<button class="button button-primary" data-drawer-mark="relevant">标记为相关</button><button class="button button-secondary" data-drawer-mark="focus">重点关注</button><button class="button button-secondary" data-reparse-notice>重新解析</button><button class="button button-danger" data-drawer-delete>软删除</button>';
   body.innerHTML = `<div class="drawer-title-block"><div class="drawer-badges"><span class="source-chip ${notice.platformClass}">${notice.platformName}</span><span class="status-tag status-${notice.status}">${notice.statusText}</span><span class="mark-tag mark-${notice.mark}">${notice.markText}</span></div><h2 class="drawer-title">${esc(notice.title)}</h2><div class="drawer-source"><span>来源链接</span><a href="${esc(notice.sourceUrl || '#')}" target="_blank" rel="noreferrer">打开原公告 ↗</a><span style="margin-left:auto;color:#a1aabb">${notice.isDeleted ? `删除于 ${esc(beijingDateTime(notice.deletedAt))}` : `采集于 ${esc(notice.date)}`}</span></div><div class="drawer-actions">${actions}</div></div><div class="drawer-tabs"><button class="filter-tab ${appState.detailTab === 'info' ? 'active' : ''}" data-detail-tab="info">项目信息</button><button class="filter-tab ${appState.detailTab === 'evidence' ? 'active' : ''}" data-detail-tab="evidence">命中证据 <span class="tab-number">${notice.evidence.length}</span></button><button class="filter-tab ${appState.detailTab === 'files' ? 'active' : ''}" data-detail-tab="files">附件文件 <span class="tab-number">${notice.attachments}</span></button></div>${tabContent}`;
 }
 
@@ -700,9 +715,26 @@ document.addEventListener('click', event => {
   const batchMark = event.target.closest('[data-batch-mark]');
   if (batchMark) { const ids = Array.from(appState.selected); const mark = batchMark.dataset.batchMark; persistMark(ids, mark).then(() => { appState.selected.clear(); showToast('已更新所选公告的业务标记'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
   if (event.target.closest('[data-batch-delete]')) { const ids = Array.from(appState.selected); persistDelete(ids).then(() => { appState.selected.clear(); showToast('已将所选公告移入回收站'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
+  if (event.target.closest('[data-batch-permanent-delete]')) {
+    const ids = Array.from(appState.selected);
+    if (!ids.length || !window.confirm('永久删除所选公告？公告、附件、解析结果和文件哈希将无法恢复。')) return;
+    persistPermanentDelete(ids).then(() => { appState.selected.clear(); showToast('已永久删除所选公告及其附件'); return loadBackendNotices(false); }).catch(error => showToast(error.message));
+    return;
+  }
+  if (event.target.closest('[data-empty-trash]')) {
+    if (!window.confirm('确定清空回收站？所有回收站公告、附件、解析结果和文件哈希都将永久删除。')) return;
+    apiFetch('/api/notices/trash/empty', { method: 'POST' }).then(result => { appState.selected.clear(); showToast(`回收站已清空，共删除 ${result.deleted || 0} 条`); return loadBackendNotices(false); }).catch(error => showToast(error.message));
+    return;
+  }
   if (event.target.closest('[data-batch-restore]')) { const ids = Array.from(appState.selected); persistRestore(ids).then(() => { appState.selected.clear(); showToast('已恢复所选公告'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
   const restoreNotice = event.target.closest('[data-restore-notice]');
   if (restoreNotice) { persistRestore([restoreNotice.dataset.restoreNotice]).then(() => { showToast('公告已恢复到公告库'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
+  const permanentDeleteNotice = event.target.closest('[data-permanent-delete-notice]');
+  if (permanentDeleteNotice) {
+    if (!window.confirm('永久删除该公告？公告、附件、解析结果和文件哈希将无法恢复。')) return;
+    persistPermanentDelete([permanentDeleteNotice.dataset.permanentDeleteNotice]).then(() => { showToast('公告及其附件已永久删除'); return loadBackendNotices(false); }).catch(error => showToast(error.message));
+    return;
+  }
   const openFile = event.target.closest('[data-open-file]');
   if (openFile) {
     if (!backendOnline) { showToast('请先启动后端'); return; }
@@ -716,6 +748,12 @@ document.addEventListener('click', event => {
   const drawerMark = event.target.closest('[data-drawer-mark]');
   if (drawerMark && appState.detailId) { const mark = drawerMark.dataset.drawerMark; persistMark([appState.detailId], mark).then(() => { closeDetail(); showToast('业务标记已更新'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
   if (event.target.closest('[data-drawer-delete]')) { const id = appState.detailId; persistDelete([id]).then(() => { closeDetail(); showToast('公告已移入回收站，可在回收站恢复'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
+  if (event.target.closest('[data-drawer-permanent-delete]')) {
+    const id = appState.detailId;
+    if (!window.confirm('永久删除该公告？公告、附件、解析结果和文件哈希将无法恢复。')) return;
+    persistPermanentDelete([id]).then(() => { closeDetail(); showToast('公告及其附件已永久删除'); return loadBackendNotices(false); }).catch(error => showToast(error.message));
+    return;
+  }
   if (event.target.closest('[data-drawer-restore]')) { const id = appState.detailId; persistRestore([id]).then(() => { closeDetail(); showToast('公告已恢复到公告库'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
   const reparse = event.target.closest('[data-reparse-notice]');
   if (reparse && appState.detailId) { const noticeId = appState.detailId; apiFetch(`/api/notices/${noticeId}/reparse`, { method: 'POST' }).then(result => { showToast(result.message); void watchReparse(result.task_id, noticeId); }).catch(error => showToast(error.message)); return; }

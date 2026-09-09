@@ -23,7 +23,7 @@ from .adapters import AdapterError, NoticeData, make_adapter
 from .config import normalize_data_dir, settings
 from .db import beijing_time, get_db, init_db, json_load, log_event, now_iso, recover_incomplete_runs, select_site_account
 from .parsers import file_mime, parse_document, sha256_file, parser_capabilities
-from .service import create_attachment, frontend_notice, ingest_notice_data, ingest_url, rebuild_keyword_group_analysis, refresh_notice_analysis, reparse_notice, run_crawl, try_create_run
+from .service import create_attachment, frontend_notice, ingest_notice_data, ingest_url, permanently_delete_notices, rebuild_keyword_group_analysis, refresh_notice_analysis, reparse_notice, run_crawl, try_create_run
 from .scheduler import scheduler
 from .storage import absolute_from_relative, attachment_directory, relative_to_data, safe_name
 from .stabilization_migration import migrate_stabilization_schema
@@ -34,7 +34,7 @@ from .update_checker import update_monitor
 from .manual_verification import ManualVerificationError, close_verification, complete_verification, open_verification
 
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 app = FastAPI(title="猎标 V1 API", version=APP_VERSION, docs_url="/api/docs", redoc_url=None)
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 
@@ -935,6 +935,25 @@ def batch_delete(payload: BatchActionRequest) -> dict[str, Any]:
     return {"ok": True, "deleted": cursor.rowcount}
 
 
+@app.post("/api/notices/batch-permanent-delete")
+def batch_permanent_delete(payload: BatchActionRequest) -> dict[str, Any]:
+    if not payload.ids:
+        return {"ok": True, "deleted": 0}
+    with get_db() as connection:
+        deleted = permanently_delete_notices(connection, payload.ids)
+        log_event(connection, "notice.permanent_delete", f"永久删除回收站公告 {deleted} 条")
+    return {"ok": True, "deleted": deleted}
+
+
+@app.post("/api/notices/trash/empty")
+def empty_trash() -> dict[str, Any]:
+    with get_db() as connection:
+        ids = [row["id"] for row in connection.execute("SELECT id FROM notices WHERE deleted_at IS NOT NULL").fetchall()]
+        deleted = permanently_delete_notices(connection, ids, reason="empty_trash")
+        log_event(connection, "notice.trash_empty", f"清空回收站，永久删除 {deleted} 条公告")
+    return {"ok": True, "deleted": deleted}
+
+
 @app.get("/api/notices-export.csv")
 def export_notices() -> StreamingResponse:
     output = io.StringIO()
@@ -957,6 +976,17 @@ def delete_notice(notice_id: int) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="公告不存在或已经删除")
         log_event(connection, "notice.soft_delete", "公告已移入回收站", notice_id=notice_id)
     return {"ok": True, "message": "公告已移入回收站"}
+
+
+@app.delete("/api/notices/{notice_id}/permanent")
+def permanently_delete_notice(notice_id: int) -> dict[str, Any]:
+    validate_id(notice_id)
+    with get_db() as connection:
+        deleted = permanently_delete_notices(connection, [notice_id])
+        if not deleted:
+            raise HTTPException(status_code=404, detail="公告不存在或不在回收站")
+        log_event(connection, "notice.permanent_delete", "公告已永久删除")
+    return {"ok": True, "message": "公告及其附件已永久删除"}
 
 
 @app.post("/api/notices/{notice_id}/restore")

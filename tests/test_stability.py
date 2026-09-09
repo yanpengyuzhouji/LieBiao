@@ -6,11 +6,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
+
 from backend.adapters import NoticeData
 from backend.config import settings
 from backend.db import get_db, init_db, now_iso
-from backend.main import list_notices, site_health_check
-from backend.service import attachment_tree_needs_reparse, create_attachment, find_site, ingest_notice_data, refresh_notice_analysis, try_create_run
+from backend.main import app, list_notices, site_health_check
+from backend.service import attachment_tree_needs_reparse, create_attachment, find_site, ingest_notice_data, permanently_delete_notices, refresh_notice_analysis, try_create_run
 from backend.stabilization_migration import migrate_stabilization_schema
 from backend.storage import save_raw_html
 
@@ -143,6 +145,54 @@ class StabilityIntegrationTests(unittest.TestCase):
         self.assertEqual(trash["total"], 1)
         self.assertEqual(trash["category_counts"]["trash"], 1)
         self.assertEqual(trash["items"][0]["id"], str(notice_id))
+
+    def test_permanent_delete_removes_files_and_blocks_reingest(self) -> None:
+        with get_db() as connection:
+            notice_id = ingest_notice_data(
+                connection, 1,
+                NoticeData("purge-1", "待删除的储能招标公告", "https://example.com/purge-1", "正文"),
+                download_attachments=False,
+            )
+            raw = save_raw_html(notice_id, "raw")
+            extracted = settings.extracted_dir / "notices" / str(notice_id) / "parsed.txt"
+            extracted.parent.mkdir(parents=True, exist_ok=True)
+            extracted.write_text("parsed", encoding="utf-8")
+            attachment_id = create_attachment(connection, notice_id, "技术要求.pdf", None)
+            connection.execute(
+                "UPDATE attachments SET relative_path=?,sha256=?,status='stored' WHERE id=?",
+                (str(Path(raw).parent / "attachments" / "技术要求.pdf"), "attachment-hash", attachment_id),
+            )
+            connection.execute("UPDATE notices SET deleted_at=? WHERE id=?", (now_iso(), notice_id))
+            self.assertEqual(permanently_delete_notices(connection, [notice_id]), 1)
+            self.assertIsNone(connection.execute("SELECT id FROM notices WHERE id=?", (notice_id,)).fetchone())
+            self.assertIsNone(connection.execute("SELECT id FROM attachments WHERE id=?", (attachment_id,)).fetchone())
+            self.assertIsNotNone(connection.execute("SELECT id FROM deleted_notice_tombstones WHERE external_id='purge-1'").fetchone())
+        self.assertFalse((settings.data_dir / raw).exists())
+        self.assertFalse(extracted.exists())
+        with get_db() as connection:
+            self.assertIsNone(ingest_notice_data(connection, 1, NoticeData("purge-1", "待删除的储能招标公告", "https://example.com/purge-1", "正文"), download_attachments=False))
+
+    def test_permanent_delete_requires_trash_state(self) -> None:
+        with get_db() as connection:
+            notice_id = ingest_notice_data(connection, 1, NoticeData("purge-2", "普通公告", "https://example.com/purge-2", "正文"), download_attachments=False)
+            self.assertEqual(permanently_delete_notices(connection, [notice_id]), 0)
+            self.assertIsNotNone(connection.execute("SELECT id FROM notices WHERE id=?", (notice_id,)).fetchone())
+
+    def test_empty_trash_physically_deletes_all_trash_rows(self) -> None:
+        with get_db() as connection:
+            for index in range(2):
+                notice_id = ingest_notice_data(
+                    connection, 1,
+                    NoticeData(f"clear-{index}", f"待清空公告{index}", f"https://example.com/clear-{index}", "正文"),
+                    download_attachments=False,
+                )
+                connection.execute("UPDATE notices SET deleted_at=? WHERE id=?", (now_iso(), notice_id))
+        response = TestClient(app).post("/api/notices/trash/empty")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["deleted"], 2)
+        with get_db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM notices WHERE deleted_at IS NOT NULL").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM deleted_notice_tombstones WHERE external_id LIKE 'clear-%'").fetchone()[0], 2)
 
     def test_health_check_reuses_verified_manual_session(self) -> None:
         with get_db() as connection:

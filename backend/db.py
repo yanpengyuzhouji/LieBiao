@@ -176,6 +176,17 @@ CREATE TABLE IF NOT EXISTS notices (
 );
 CREATE INDEX IF NOT EXISTS idx_notices_published ON notices(published_at);
 CREATE INDEX IF NOT EXISTS idx_notices_status ON notices(ingest_status, business_mark);
+CREATE TABLE IF NOT EXISTS deleted_notice_tombstones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+    external_id TEXT,
+    source_url TEXT,
+    deleted_at TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT 'manual_permanent_delete',
+    UNIQUE(site_id, external_id),
+    UNIQUE(site_id, source_url)
+);
+CREATE INDEX IF NOT EXISTS idx_deleted_notice_tombstones_lookup ON deleted_notice_tombstones(site_id, external_id, source_url);
 CREATE TABLE IF NOT EXISTS notice_versions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     notice_id INTEGER NOT NULL REFERENCES notices(id) ON DELETE CASCADE,

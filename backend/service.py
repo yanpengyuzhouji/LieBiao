@@ -6,6 +6,8 @@ import re
 import shutil
 import tempfile
 import time
+import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,84 @@ STATUS_LABELS = {
 }
 MARK_LABELS = {"pending": "待确认", "relevant": "相关", "irrelevant": "不相关", "supplement": "待补充", "focus": "重点关注", "processed": "已处理"}
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+_PERMANENT_DELETE_LOCK = threading.Lock()
+
+
+def _canonical_notice_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    parsed = urlparse(str(value).strip())
+    if not parsed.scheme or not parsed.netloc:
+        return str(value).strip() or None
+    path = parsed.path.rstrip("/") or "/"
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}{('?' + parsed.query) if parsed.query else ''}"
+
+
+def is_permanently_deleted(connection, site_id: int | None, external_id: str | None, source_url: str | None) -> bool:
+    """Check the minimal identity tombstone before a crawl or import can write."""
+    canonical_url = _canonical_notice_url(source_url)
+    row = connection.execute(
+        """SELECT 1 FROM deleted_notice_tombstones
+        WHERE site_id IS ? AND (
+            (external_id IS NOT NULL AND ? IS NOT NULL AND external_id=?)
+            OR (source_url IS NOT NULL AND ? IS NOT NULL AND source_url=?)
+        ) LIMIT 1""",
+        (site_id, external_id, external_id, canonical_url, canonical_url),
+    ).fetchone()
+    return bool(row)
+
+
+def permanently_delete_notices(connection, notice_ids: list[int], reason: str = "manual_permanent_delete") -> int:
+    """Delete trash rows, their DB children, and their private files as one guarded operation."""
+    ids = sorted({int(value) for value in notice_ids})
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    with _PERMANENT_DELETE_LOCK:
+        rows = connection.execute(
+            f"SELECT id,site_id,external_id,source_url,deleted_at FROM notices WHERE id IN ({placeholders}) AND deleted_at IS NOT NULL",
+            ids,
+        ).fetchall()
+        if not rows:
+            return 0
+        staging = settings.temp_dir / "permanent-delete" / uuid.uuid4().hex
+        moved: list[tuple[Path, Path]] = []
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            for row in rows:
+                for label, directory in (
+                    ("raw", settings.raw_dir / "notices" / str(row["id"])),
+                    ("extracted", settings.extracted_dir / "notices" / str(row["id"])),
+                ):
+                    if directory.exists():
+                        target = staging / label / str(row["id"])
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        directory.replace(target)
+                        moved.append((directory, target))
+            timestamp = now_iso()
+            for row in rows:
+                connection.execute(
+                    "INSERT OR IGNORE INTO deleted_notice_tombstones(site_id,external_id,source_url,deleted_at,reason) VALUES(?,?,?,?,?)",
+                    (row["site_id"], row["external_id"], _canonical_notice_url(row["source_url"]), timestamp, reason),
+                )
+            connection.execute(f"UPDATE system_logs SET notice_id=NULL WHERE notice_id IN ({placeholders})", ids)
+            connection.execute(f"DELETE FROM extracted_documents WHERE attachment_id IN (SELECT id FROM attachments WHERE notice_id IN ({placeholders}))", ids)
+            connection.execute(f"UPDATE extracted_fields SET source_attachment_id=NULL WHERE notice_id IN ({placeholders})", ids)
+            connection.execute(f"DELETE FROM extracted_fields WHERE notice_id IN ({placeholders})", ids)
+            connection.execute(f"DELETE FROM keyword_hits WHERE notice_id IN ({placeholders})", ids)
+            connection.execute(f"DELETE FROM notice_keyword_bindings WHERE notice_id IN ({placeholders})", ids)
+            connection.execute(f"DELETE FROM notice_versions WHERE notice_id IN ({placeholders})", ids)
+            connection.execute(f"UPDATE attachments SET parent_attachment_id=NULL WHERE notice_id IN ({placeholders})", ids)
+            connection.execute(f"DELETE FROM attachments WHERE notice_id IN ({placeholders})", ids)
+            connection.execute(f"DELETE FROM notices WHERE id IN ({placeholders}) AND deleted_at IS NOT NULL", ids)
+            shutil.rmtree(staging, ignore_errors=False)
+            return len(rows)
+        except Exception:
+            for original, target in reversed(moved):
+                if target.exists() and not original.exists():
+                    original.parent.mkdir(parents=True, exist_ok=True)
+                    target.replace(original)
+            raise
 
 
 def ensure_run_tracking_schema(connection) -> None:
@@ -455,6 +535,10 @@ def discard_unmatched_notice(connection, notice_id: int) -> None:
 def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapter: BaseAdapter | None = None, source_type: str = "crawl", download_attachments: bool = True, keyword_group_id: int | None = None, filter_unmatched: bool = False, crawl_job_id: int | None = None, crawl_run_id: int | None = None) -> int | None:
     timestamp = now_iso()
     fingerprint = hashlib.sha256((data.title + "\n" + data.body_text).encode("utf-8", errors="ignore")).hexdigest()
+    if is_permanently_deleted(connection, site_id, data.external_id, data.url):
+        if source_type == "crawl":
+            return None
+        raise AdapterError("该公告已被永久删除并加入采集排除名单，如需重新导入请先解除永久排除")
     existing = connection.execute("SELECT * FROM notices WHERE site_id IS ? AND (external_id=? OR source_url=?) ORDER BY id LIMIT 1", (site_id, data.external_id, data.url)).fetchone()
     if existing and existing["deleted_at"]:
         if source_type == "crawl":
@@ -628,6 +712,13 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
                     (job["site_id"],),
                 ).fetchall()
             }
+            existing_ids.update(
+                str(row["external_id"])
+                for row in connection.execute(
+                    "SELECT external_id FROM deleted_notice_tombstones WHERE site_id=? AND external_id IS NOT NULL",
+                    (job["site_id"],),
+                ).fetchall()
+            )
         # Date/type policy is applied twice: list metadata avoids unnecessary
         # detail requests, while detail metadata is authoritative before write.
         candidate_limit = max(1, int(job["max_notices"]))
@@ -659,6 +750,10 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
                 probe_rejection = notice_policy_rejection(now_iso(), summary.notice_type, cutoff, allowed_categories)
                 if probe_rejection and "公告类型" in probe_rejection:
                     record_filter(summary.title, probe_rejection)
+                    continue
+            with get_db() as connection:
+                if is_permanently_deleted(connection, job["site_id"], summary.external_id, summary.url):
+                    record_filter(summary.title, "该公告已永久删除，禁止再次入库")
                     continue
             try:
                 data: NoticeData | None = None

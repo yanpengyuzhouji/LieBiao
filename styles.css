@@ -160,6 +160,8 @@ h1 { margin: 10px 0 7px; color: var(--ink); font-size: 30px; line-height: 1.08; 
 .batch-bar .batch-actions { display: flex; gap: 6px; margin-left: auto; }
 .batch-action { padding: 5px 8px; border: 1px solid var(--line-strong); border-radius: 5px; color: #69758e; background: #fff; font-size: 10px; }
 .batch-action.danger { color: var(--red); }
+.trash-actions { display: flex; align-items: center; gap: 12px; padding: 10px 20px; border-top: 1px solid var(--line); background: #fffaf9; color: #9a6b6b; font-size: 10px; }
+.trash-actions span { flex: 1; }
 
 .table-card { overflow: hidden; border-radius: 0 0 12px 12px; }
 .table-scroll { overflow-x: auto; }

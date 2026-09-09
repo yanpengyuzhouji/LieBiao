@@ -23,7 +23,7 @@ class ManualVerificationError(RuntimeError):
 @dataclass
 class BrowserSession:
     port: int
-    process: subprocess.Popen
+    process: subprocess.Popen | None
     host: str
     profile: Path | None = None
 
@@ -50,6 +50,35 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _profile_is_locked(profile: Path) -> bool:
+    """Return whether Edge is likely already using this profile directory."""
+    return any((profile / name).exists() for name in ("lockfile", "SingletonLock", "SingletonSocket"))
+
+
+def _process_alive(process: subprocess.Popen | None) -> bool:
+    return process is not None and process.poll() is None
+
+
+def _attach_session(site_id: int, port: int, expected_host: str | None = None) -> BrowserSession:
+    """Reattach to a still-running Edge instance after the API process restarted."""
+    try:
+        targets = httpx.get(f"http://127.0.0.1:{port}/json", timeout=3).json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ManualVerificationError("专用验证窗口已关闭，请重新打开人工验证") from exc
+    target = next((item for item in targets if item.get("type") == "page"
+                   and item.get("webSocketDebuggerUrl")
+                   and (urlparse(item.get("url", "")).hostname or "").lower()), None)
+    if not target:
+        raise ManualVerificationError("未找到验证页面，请保持专用验证窗口打开")
+    host = (urlparse(target.get("url", "")).hostname or "").lower()
+    if expected_host and host != expected_host.lower():
+        raise ManualVerificationError("浏览器验证页面与平台不一致，请打开正确的平台页面")
+    session = BrowserSession(port=port, process=None, host=host)
+    with _lock:
+        _sessions[site_id] = session
+    return session
+
+
 def open_verification(site_id: int, url: str, profile_root: Path) -> dict[str, object]:
     if not sys.platform.startswith("win"):
         raise ManualVerificationError("人工验证窗口目前仅支持 Windows 桌面版")
@@ -59,6 +88,13 @@ def open_verification(site_id: int, url: str, profile_root: Path) -> dict[str, o
     port = _free_port()
     profile = (profile_root / str(site_id)).resolve()
     profile.mkdir(parents=True, exist_ok=True)
+    # If an older Edge process still owns the stable profile (for example after
+    # an application update), launching with the same profile can hand the URL
+    # to that process and exit without exposing the new debug port. Use an
+    # isolated profile for this verification attempt instead.
+    if _profile_is_locked(profile):
+        profile = (profile_root / f"{site_id}-{int(time.time())}").resolve()
+        profile.mkdir(parents=True, exist_ok=True)
     process = subprocess.Popen(
         [
             _edge_path(), f"--remote-debugging-port={port}", "--remote-allow-origins=*",
@@ -79,9 +115,13 @@ def open_verification(site_id: int, url: str, profile_root: Path) -> dict[str, o
     with _lock:
         previous = _sessions.pop(site_id, None)
         _sessions[site_id] = BrowserSession(port, process, host, profile)
-    if previous and previous.process.poll() is None:
+    if previous and _process_alive(previous.process):
         previous.process.terminate()
-    return {"opened": True, "message": "验证窗口已打开，请完成验证后返回系统点击“验证完成”"}
+    return {
+        "opened": True,
+        "port": port,
+        "message": "验证窗口已打开，请完成验证后返回系统点击“验证完成”",
+    }
 
 
 def _cookie_header(cookies: list[dict[str, object]], host: str) -> str:
@@ -93,13 +133,17 @@ def _cookie_header(cookies: list[dict[str, object]], host: str) -> str:
     return "; ".join(usable)
 
 
-def browser_request(site_id: int, url: str, method: str = "GET", payload: dict | None = None) -> dict:
+def browser_request(site_id: int, url: str, method: str = "GET", payload: dict | None = None,
+                    port: int | None = None) -> dict:
     """Run a same-origin public request inside an open verified Edge page."""
     with _lock:
         session = _sessions.get(site_id)
-    if not session or session.process.poll() is not None:
+    expected_host = (urlparse(url).hostname or "").lower()
+    if not session and port:
+        session = _attach_session(site_id, port, expected_host)
+    if not session or not _process_alive(session.process) and session.process is not None:
         raise ManualVerificationError("华能专用采集窗口已关闭，请在“平台与账号”重新打开后采集")
-    if (urlparse(url).hostname or "").lower() != session.host:
+    if expected_host != session.host:
         raise ManualVerificationError("浏览器采集请求地址与验证平台不一致")
     targets = httpx.get(f"http://127.0.0.1:{session.port}/json", timeout=3).json()
     target = next((item for item in targets if item.get("type") == "page"
@@ -130,10 +174,12 @@ def browser_request(site_id: int, url: str, method: str = "GET", payload: dict |
             return json.loads(result.get("text") or "{}")
 
 
-def complete_verification(site_id: int) -> str:
+def complete_verification(site_id: int, port: int | None = None) -> str:
     with _lock:
         session = _sessions.get(site_id)
-    if not session or session.process.poll() is not None:
+    if not session and port:
+        session = _attach_session(site_id, port)
+    if not session or not _process_alive(session.process) and session.process is not None:
         raise ManualVerificationError("没有正在运行的验证窗口，请先点击“打开人工验证”")
     try:
         targets = httpx.get(f"http://127.0.0.1:{session.port}/json", timeout=3).json()
@@ -177,6 +223,7 @@ def complete_verification(site_id: int) -> str:
         if user_agent:
             encoded = base64.urlsafe_b64encode(user_agent.encode("utf-8")).decode("ascii")
             header = f"{header}; __scout_user_agent={encoded}"
+        header = f"{header}; __scout_browser_port={session.port}"
         return header
     except (httpx.HTTPError, ValueError, OSError, TimeoutError) as exc:
         raise ManualVerificationError(f"读取验证会话失败：{exc}") from exc
@@ -185,11 +232,30 @@ def complete_verification(site_id: int) -> str:
 def close_verification(site_id: int) -> None:
     with _lock:
         session = _sessions.pop(site_id, None)
-    if not session or session.process.poll() is not None:
+    if not session:
         return
     try:
         version = httpx.get(f"http://127.0.0.1:{session.port}/json/version", timeout=2).json()
         with connect(version["webSocketDebuggerUrl"], origin=f"http://127.0.0.1:{session.port}", open_timeout=2) as websocket:
             websocket.send(json.dumps({"id": 1, "method": "Browser.close"}))
     except (httpx.HTTPError, KeyError, ValueError, OSError, TimeoutError):
-        session.process.terminate()
+        if _process_alive(session.process):
+            session.process.terminate()
+
+
+def browser_session_port(session_cookie: str | None) -> int | None:
+    """Read the persisted local Edge debug port from a session credential."""
+    if not session_cookie:
+        return None
+    for item in session_cookie.split(";"):
+        if "=" not in item:
+            continue
+        key, value = item.strip().split("=", 1)
+        if key != "__scout_browser_port":
+            continue
+        try:
+            port = int(value)
+        except ValueError:
+            return None
+        return port if 1 <= port <= 65535 else None
+    return None

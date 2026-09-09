@@ -31,10 +31,10 @@ from . import reparse_tasks
 from .maintenance import activity
 from .migration import adopt_storage, migrate_storage
 from .update_checker import update_monitor
-from .manual_verification import ManualVerificationError, close_verification, complete_verification, open_verification
+from .manual_verification import ManualVerificationError, browser_session_port, close_verification, complete_verification, open_verification
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 app = FastAPI(title="猎标 V1 API", version=APP_VERSION, docs_url="/api/docs", redoc_url=None)
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 
@@ -332,7 +332,34 @@ def open_site_verification(site_id: int) -> dict[str, Any]:
             verification_url = "https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/search"
         elif site["code"] == "espic":
             verification_url = "https://ebid.espic.com.cn/newgdtcms//category/bulletinListNew.html?dates=300&categoryId=2&tenderMethod=01&tabName=%E6%8B%9B%E6%A0%87%E4%BF%A1%E6%81%AF&page=1"
-        return open_verification(site_id, verification_url, settings.data_dir / "browser_sessions")
+        result = open_verification(site_id, verification_url, settings.data_dir / "browser_sessions")
+        # Keep the local debug port in the account record immediately. This is
+        # what lets the API reconnect to an Edge window after an app restart,
+        # even when the user has not clicked “验证完成” yet.
+        port = result.get("port") if isinstance(result, dict) else None
+        if isinstance(port, int) and 1 <= port <= 65535:
+            with get_db() as connection:
+                timestamp = now_iso()
+                credential = f"__scout_browser_port={port}"
+                account = connection.execute(
+                    "SELECT id FROM site_accounts WHERE site_id=? AND alias='人工验证会话' ORDER BY id LIMIT 1",
+                    (site_id,),
+                ).fetchone()
+                if account:
+                    connection.execute(
+                        "UPDATE site_accounts SET credential_ref=?,session_status='needs_manual',status_reason=?,enabled=0 WHERE id=?",
+                        (credential, "验证窗口已打开，请完成验证", account["id"]),
+                    )
+                else:
+                    connection.execute(
+                        "INSERT INTO site_accounts(site_id,alias,login_mode,credential_ref,session_status,status_reason,enabled,created_at) VALUES(?,?,'manual_session',?,'needs_manual',?,0,?)",
+                        (site_id, "人工验证会话", credential, "验证窗口已打开，请完成验证", timestamp),
+                    )
+                connection.execute(
+                    "UPDATE sites SET health_status='unknown',health_message=?,last_checked_at=? WHERE id=?",
+                    ("验证窗口已打开，请完成验证", timestamp, site_id),
+                )
+        return result
     except ManualVerificationError as exc:
         with get_db() as connection:
             timestamp = now_iso()
@@ -359,7 +386,18 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
     completed = False
     try:
         try:
-            cookie = complete_verification(site_id)
+            browser_port = None
+            with get_db() as connection:
+                account = connection.execute(
+                    "SELECT credential_ref FROM site_accounts WHERE site_id=? AND alias='人工验证会话' ORDER BY id LIMIT 1",
+                    (site_id,),
+                ).fetchone()
+                if account:
+                    browser_port = browser_session_port(account["credential_ref"])
+            if browser_port is None:
+                cookie = complete_verification(site_id)
+            else:
+                cookie = complete_verification(site_id, port=browser_port)
         except ManualVerificationError as session_error:
             # Public platforms may never set a login cookie. In that case the
             # useful result is a live collection check, not a fake account.

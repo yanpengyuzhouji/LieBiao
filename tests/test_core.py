@@ -35,6 +35,20 @@ class AdapterParsingTests(unittest.TestCase):
         finally:
             adapter.close()
 
+    def test_saved_browser_port_is_routing_metadata_not_target_cookie(self) -> None:
+        with unittest.mock.patch('backend.adapters.detect_outbound_proxy', return_value=None):
+            adapter = BaseAdapter(
+                'https://example.com',
+                'session=ok; __scout_browser_session=257; __scout_browser_port=43210',
+            )
+        try:
+            self.assertEqual(adapter.browser_site_id, 257)
+            self.assertEqual(adapter.browser_port, 43210)
+            self.assertNotIn('__scout_browser_session', adapter.client.cookies)
+            self.assertNotIn('__scout_browser_port', adapter.client.cookies)
+        finally:
+            adapter.close()
+
     def test_hash_route_external_ids(self) -> None:
         self.assertEqual(
             extract_external_id("https://ecp.sgcc.com.cn/ecp2.0/portal/#/doc/doci-bid/2609030023176732_2018032900295987"),

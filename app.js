@@ -9,6 +9,7 @@ const appState = {
 let backendOnline = false;
 let searchTimer = null;
 let updateInfo = null;
+let updateCheckRetryTimer = null;
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 const activeRunWatchers = new Set();
 const activeReparseWatchers = new Set();
@@ -54,7 +55,15 @@ async function checkForUpdates() {
   if (!backendOnline) return;
   try {
     const result = await apiFetch('/api/update/check');
-    if (!result.available) return;
+    if (!result.available) {
+      if (result.enabled && !result.latest_version && !result.error && !updateCheckRetryTimer) {
+        updateCheckRetryTimer = setTimeout(() => {
+          updateCheckRetryTimer = null;
+          void checkForUpdates();
+        }, 500);
+      }
+      return;
+    }
     const alreadyNotified = updateInfo && updateInfo.latest_version === result.latest_version;
     updateInfo = result;
     const button = $('.notification-button');
@@ -63,7 +72,7 @@ async function checkForUpdates() {
       button.setAttribute('aria-label', `发现新版本 ${result.latest_version}`);
       button.classList.add('has-update');
     }
-    if (!alreadyNotified) showToast(`发现新版本 ${result.latest_version}，点击右上角通知按钮查看`);
+    if (!alreadyNotified) openUpdateDialog(result);
   } catch (_) { /* 更新检查失败不影响本地功能 */ }
 }
 
@@ -612,6 +621,18 @@ function showToast(message) {
   setTimeout(() => { toast.classList.add('fade'); setTimeout(() => toast.remove(), 350); }, 2600);
 }
 
+function openUpdateDialog(result) {
+  const version = $('#update-version-text');
+  const notes = $('#update-notes');
+  const download = $('#update-download');
+  if (version) version.textContent = `当前版本 ${result.current_version || '未知'}，可升级到 V${result.latest_version}`;
+  if (notes) notes.textContent = result.notes || '新版本已发布，建议及时更新以获得最新功能和修复。';
+  if (download) download.href = result.release_url || '#';
+  $('#update-modal-backdrop').classList.add('visible');
+}
+
+function closeUpdateDialog() { $('#update-modal-backdrop').classList.remove('visible'); }
+
 function openImport() { $('#import-modal-backdrop').classList.add('visible'); }
 function closeImport() { $('#import-modal-backdrop').classList.remove('visible'); }
 
@@ -693,9 +714,10 @@ async function saveStorageConfig() {
 document.addEventListener('click', event => {
   if (event.target.closest('.notification-button')) {
     if (!updateInfo) { showToast('当前没有新版本通知'); return; }
-    window.open(updateInfo.release_url, '_blank', 'noopener');
+    openUpdateDialog(updateInfo);
     return;
   }
+  if (event.target.closest('[data-close-update]') || event.target === $('#update-modal-backdrop')) { closeUpdateDialog(); return; }
   const nav = event.target.closest('[data-view]');
   if (nav) { setView(nav.dataset.view); return; }
   const viewLink = event.target.closest('[data-view-link]');

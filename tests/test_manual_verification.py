@@ -66,6 +66,31 @@ class ManualVerificationTests(unittest.TestCase):
         self.assertIn('enterprise_session=signed-in', credential)
         self.assertEqual(connector.call_args.args[0], 'ws://enterprise')
 
+    def test_verification_reconnects_to_persisted_edge_port(self):
+        from backend.manual_verification import complete_verification
+        ws = unittest.mock.MagicMock()
+        ws.__enter__.return_value = ws
+        ws.recv.side_effect = [json.dumps(item) for item in (
+            {'id': 1, 'result': {'cookies': [
+                {'domain': '.chng.com.cn', 'name': 'session', 'value': 'reconnected'},
+            ]}},
+            {'id': 2, 'result': {'result': {'value': 'Mozilla/5.0 Test'}}},
+            {'id': 3, 'result': {'result': {'value': '{"title":"华能电子商务平台"}'}}},
+        )]
+        targets = [{
+            'type': 'page',
+            'url': 'https://ec.chng.com.cn/channel/home/#/purchase?top=0',
+            'webSocketDebuggerUrl': 'ws://reconnected',
+        }]
+        with patch('backend.manual_verification._sessions', {}), \
+                patch('backend.manual_verification.httpx.get') as getter, \
+                patch('backend.manual_verification.connect', return_value=ws) as connector:
+            getter.return_value.json.return_value = targets
+            credential = complete_verification(257, port=43210)
+        self.assertIn('session=reconnected', credential)
+        self.assertIn('__scout_browser_port=43210', credential)
+        self.assertEqual(connector.call_args.args[0], 'ws://reconnected')
+
     def test_open_verification_routes_all_platforms_without_server_error(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(settings, 'data_dir', Path(folder)):
             init_db()

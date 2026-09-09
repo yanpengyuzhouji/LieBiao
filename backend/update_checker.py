@@ -49,7 +49,17 @@ def check_update(current_version: str, manifest_url: str) -> dict:
     except (ValueError, UnicodeDecodeError) as exc:
         raise UpdateCheckError("更新源没有返回有效 JSON") from exc
     latest = str(payload.get("tag_name") or payload.get("version") or "").lstrip("vV")
-    release_url = str(payload.get("html_url") or payload.get("release_url") or payload.get("download_url") or "").strip()
+    release_page_url = str(payload.get("html_url") or payload.get("release_url") or "").strip()
+    assets = payload.get("assets") if isinstance(payload.get("assets"), list) else []
+    asset_urls = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        asset_name = str(asset.get("name") or "").lower()
+        asset_url = str(asset.get("browser_download_url") or "").strip()
+        if asset_url and (asset_name.endswith(".exe") or "installer" in asset_name):
+            asset_urls.append(asset_url)
+    release_url = asset_urls[0] if asset_urls else str(payload.get("download_url") or release_page_url).strip()
     if urlparse(release_url).scheme != "https":
         raise UpdateCheckError("更新下载页必须使用 HTTPS")
     available = version_key(latest) > version_key(current_version)
@@ -58,6 +68,7 @@ def check_update(current_version: str, manifest_url: str) -> dict:
         "current_version": current_version,
         "latest_version": latest,
         "release_url": release_url,
+        "release_page_url": release_page_url,
         "notes": str(payload.get("body") or payload.get("notes") or "")[:4000],
         "published_at": payload.get("published_at"),
     }

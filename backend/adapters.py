@@ -194,6 +194,7 @@ class BaseAdapter:
         self._last_request_started: float | None = None
         self._request_lock = threading.Lock()
         self.browser_site_id: int | None = None
+        self.browser_port: int | None = None
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "Accept": "text/html,application/json,application/xhtml+xml,*/*;q=0.8",
@@ -212,6 +213,13 @@ class BaseAdapter:
                     elif key == "__scout_browser_session":
                         try:
                             self.browser_site_id = int(value)
+                        except ValueError:
+                            pass
+                    elif key == "__scout_browser_port":
+                        try:
+                            port = int(value)
+                            if 1 <= port <= 65535:
+                                self.browser_port = port
                         except ValueError:
                             pass
                     else:
@@ -564,7 +572,7 @@ class ChngAdapter(BaseAdapter):
         if self.browser_site_id:
             from .manual_verification import ManualVerificationError, browser_request
             try:
-                return browser_request(self.browser_site_id, url, method, payload)
+                return browser_request(self.browser_site_id, url, method, payload, port=self.browser_port)
             except ManualVerificationError as exc:
                 raise AdapterError(str(exc)) from exc
         response = self.client.request(method, url, json=payload, headers={"Referer": self.base_url})

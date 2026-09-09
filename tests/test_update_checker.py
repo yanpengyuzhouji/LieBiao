@@ -11,6 +11,8 @@ class UpdateCheckerTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "app.js").read_text(encoding="utf-8")
         self.assertIn("const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000", source)
         self.assertIn("setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL_MS)", source)
+        self.assertIn("function openUpdateDialog(result)", source)
+        self.assertIn("if (!alreadyNotified) openUpdateDialog(result)", source)
         self.assertNotIn("window.confirm(`发现新版本", source)
 
     def test_semantic_version_comparison(self):
@@ -21,11 +23,12 @@ class UpdateCheckerTests(unittest.TestCase):
     def test_github_release_is_normalized(self, stream):
         response = Mock(headers={})
         response.raise_for_status.return_value = None
-        response.iter_bytes.return_value = [b'{"tag_name":"v1.2.0","html_url":"https://github.com/example/project/releases/tag/v1.2.0","body":"changes"}']
+        response.iter_bytes.return_value = [b'{"tag_name":"v1.2.0","html_url":"https://github.com/example/project/releases/tag/v1.2.0","assets":[{"name":"LieBiao-Setup-1.2.0-win-x64.exe","browser_download_url":"https://github.com/example/project/releases/download/v1.2.0/LieBiao-Setup-1.2.0-win-x64.exe"}],"body":"changes"}']
         stream.return_value.__enter__.return_value = response
         result = check_update("1.1.0", "https://api.github.com/repos/example/project/releases/latest")
         self.assertTrue(result["available"])
         self.assertEqual(result["latest_version"], "1.2.0")
+        self.assertEqual(result["release_url"], "https://github.com/example/project/releases/download/v1.2.0/LieBiao-Setup-1.2.0-win-x64.exe")
 
     def test_non_https_manifest_is_rejected(self):
         with self.assertRaises(UpdateCheckError):

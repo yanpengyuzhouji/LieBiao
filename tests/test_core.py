@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import base64
 import tempfile
 import unittest
 import zipfile
@@ -22,6 +23,17 @@ class AdapterParsingTests(unittest.TestCase):
 
         def json(self) -> dict:
             return self.payload
+
+    def test_saved_browser_user_agent_is_reused_but_not_sent_as_cookie(self) -> None:
+        user_agent = "Mozilla/5.0 Edg/140.0"
+        encoded = base64.urlsafe_b64encode(user_agent.encode()).decode()
+        with unittest.mock.patch('backend.adapters.detect_outbound_proxy', return_value=None):
+            adapter = BaseAdapter('https://example.com', f'session=ok; __scout_user_agent={encoded}')
+        try:
+            self.assertEqual(adapter.client.headers['User-Agent'], user_agent)
+            self.assertNotIn('__scout_user_agent', adapter.client.cookies)
+        finally:
+            adapter.close()
 
     def test_hash_route_external_ids(self) -> None:
         self.assertEqual(
@@ -193,7 +205,7 @@ class AdapterParsingTests(unittest.TestCase):
         adapter = ChngAdapter.__new__(ChngAdapter)
         self.assertEqual(
             adapter.public_detail_url("https://ec.chng.com.cn/channel/home/#/detail?id=12861658"),
-            "https://ec.chng.com.cn/ecmall/announcement/announcementDetailTender.do?announcementId=12861658",
+            "https://ec.chng.com.cn/channel/home/#/detail?id=12861658",
         )
 
 

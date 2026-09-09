@@ -358,12 +358,21 @@ def seed_base_data(connection: sqlite3.Connection) -> None:
         ("epec", "中国石化物资", "https://bidding.epec.com/tenderInfoOne?key=1", "epec", "public"),
         ("chng", "中国华能", "https://ec.chng.com.cn/channel/home/#/purchase?top=0", "chng", "public"),
         ("cdt", "大唐集团", "https://tang.cdt-ec.com/notice/moreController/toMore?globleType=0", "cdt", "public"),
+        ("ceb", "中国招标投标公共服务平台", "https://bulletin.cebpubservice.com/", "ceb", "restricted"),
+        ("yfb", "乙方宝", "https://www.yfbzb.com/search/invitedBidSearch?defaultSearch=true", "yfb", "public_partial"),
+        ("chnenergy", "国家能源（国能e招）", "https://www.chnenergybidding.com.cn/bidweb/", "chnenergy", "public"),
+        ("espic", "中国电力设备信息网", "https://ebid.espic.com.cn/newgdtcms//category/bulletinListNew.html?dates=300&categoryId=2&tenderMethod=01&tabName=%E6%8B%9B%E6%A0%87%E4%BF%A1%E6%81%AF&page=1", "espic", "restricted"),
+        ("cgn", "中广核", "https://ecp.cgnpc.com.cn/Default.html", "cgn", "public"),
+        ("chdtp", "中国华电集团电子商务平台", "https://www.chdtp.com/pages/wzglS/homepage/index.jsp", "chdtp", "public_or_session"),
     ]
     for code, name, url, adapter, public_mode in sites:
         connection.execute(
             "INSERT OR IGNORE INTO sites(code,name,base_url,adapter,public_mode,health_status,created_at) VALUES(?,?,?,?,?,'unknown',?)",
             (code, name, url, adapter, public_mode, timestamp),
         )
+    # Keep corrected official announcement entries when upgrading an existing DB.
+    connection.execute("UPDATE sites SET base_url='https://bulletin.cebpubservice.com/' WHERE code='ceb'")
+    connection.execute("UPDATE sites SET base_url='https://ebid.espic.com.cn/newgdtcms//category/bulletinListNew.html?dates=300&categoryId=2&tenderMethod=01&tabName=%E6%8B%9B%E6%A0%87%E4%BF%A1%E6%81%AF&page=1' WHERE code='espic'")
     keyword = connection.execute("SELECT id FROM keyword_groups WHERE name = '储能与新能源'").fetchone()
     if first_install and not keyword:
         connection.execute(
@@ -402,6 +411,32 @@ def seed_base_data(connection: sqlite3.Connection) -> None:
     }
     for key, value in defaults.items():
         connection.execute("INSERT OR IGNORE INTO app_settings(key,value,updated_at) VALUES(?,?,?)", (key, value, timestamp))
+
+
+def select_site_account(connection: sqlite3.Connection, site_id: int, account_id: int | None = None):
+    """Resolve an eligible same-platform account without changing user bindings."""
+    query = "SELECT * FROM site_accounts WHERE site_id=? AND enabled=1"
+    params = [site_id]
+    if account_id is not None:
+        query += " AND id=? AND session_status IN ('verified','public')"
+        params.append(account_id)
+    else:
+        query += " AND session_status='verified'"
+    query += " ORDER BY last_login_at DESC,id DESC"
+    for row in connection.execute(query, params).fetchall():
+        if row['session_status'] == 'verified' and not row['credential_ref']:
+            continue
+        if row['expires_at']:
+            try:
+                expires = datetime.fromisoformat(row['expires_at'].replace('Z', '+00:00'))
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=BEIJING_TZ)
+                if expires <= datetime.now(timezone.utc):
+                    continue
+            except ValueError:
+                continue
+        return row
+    return None
 
 
 def log_event(connection: sqlite3.Connection, event_type: str, message: str, level: str = "INFO", notice_id: int | None = None, crawl_run_id: int | None = None) -> None:

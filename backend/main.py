@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from .adapters import AdapterError, NoticeData, make_adapter
 from .config import normalize_data_dir, settings
-from .db import beijing_time, get_db, init_db, json_load, log_event, now_iso, recover_incomplete_runs
+from .db import beijing_time, get_db, init_db, json_load, log_event, now_iso, recover_incomplete_runs, select_site_account
 from .parsers import file_mime, parse_document, sha256_file, parser_capabilities
 from .service import create_attachment, frontend_notice, ingest_notice_data, ingest_url, rebuild_keyword_group_analysis, refresh_notice_analysis, reparse_notice, run_crawl, try_create_run
 from .scheduler import scheduler
@@ -303,10 +303,7 @@ def site_health_check(site_id: int) -> dict[str, Any]:
     validate_id(site_id, "平台")
     with get_db() as connection:
         site = connection.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
-        account = connection.execute(
-            "SELECT credential_ref FROM site_accounts WHERE site_id=? AND enabled=1 AND session_status='verified' ORDER BY last_login_at DESC,id DESC LIMIT 1",
-            (site_id,),
-        ).fetchone()
+        account = select_site_account(connection, site_id)
     if not site:
         raise HTTPException(status_code=404, detail="平台不存在")
     adapter = make_adapter(site["code"], site["base_url"], session_cookie=account["credential_ref"] if account else None)
@@ -324,11 +321,18 @@ def site_health_check(site_id: int) -> dict[str, Any]:
 def open_site_verification(site_id: int) -> dict[str, Any]:
     validate_id(site_id, "平台")
     with get_db() as connection:
-        site = connection.execute("SELECT id,name,base_url FROM sites WHERE id=?", (site_id,)).fetchone()
+        site = connection.execute("SELECT id,name,code,base_url FROM sites WHERE id=?", (site_id,)).fetchone()
     if not site:
         raise HTTPException(status_code=404, detail="平台不存在")
     try:
-        return open_verification(site_id, site["base_url"], settings.data_dir / "browser_sessions")
+        verification_url = site["base_url"]
+        if site["code"] == "chng":
+            verification_url = "https://ec.chng.com.cn/channel/home/#/purchase?top=0"
+        elif site["code"] == "yfb":
+            verification_url = "https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/search"
+        elif site["code"] == "espic":
+            verification_url = "https://ebid.espic.com.cn/newgdtcms//category/bulletinListNew.html?dates=300&categoryId=2&tenderMethod=01&tabName=%E6%8B%9B%E6%A0%87%E4%BF%A1%E6%81%AF&page=1"
+        return open_verification(site_id, verification_url, settings.data_dir / "browser_sessions")
     except ManualVerificationError as exc:
         with get_db() as connection:
             timestamp = now_iso()
@@ -352,8 +356,36 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
         site = connection.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
     if not site:
         raise HTTPException(status_code=404, detail="平台不存在")
+    completed = False
     try:
-        cookie = complete_verification(site_id)
+        try:
+            cookie = complete_verification(site_id)
+        except ManualVerificationError as session_error:
+            # Public platforms may never set a login cookie. In that case the
+            # useful result is a live collection check, not a fake account.
+            adapter = make_adapter(site["code"], site["base_url"])
+            try:
+                public_result = adapter.health_check()
+            finally:
+                adapter.close()
+            if public_result["ok"]:
+                with get_db() as connection:
+                    timestamp = now_iso()
+                    message = "公开采集正常，无需人工验证"
+                    connection.execute(
+                        "UPDATE sites SET health_status='healthy',health_message=?,last_checked_at=? WHERE id=?",
+                        (message, timestamp, site_id),
+                    )
+                    connection.execute(
+                        "UPDATE site_accounts SET session_status='public',status_reason=?,enabled=0 WHERE site_id=? AND alias='人工验证会话'",
+                        (message, site_id),
+                    )
+                    log_event(connection, "site.manual_verify", f"{site['name']}：{message}")
+                completed = True
+                return {"ok": True, "mode": "public", "message": message}
+            raise ManualVerificationError(f"{session_error}；公开采集检查也未通过：{public_result['message']}") from session_error
+        if site["code"] in ("chng", "yfb"):
+            cookie = f"{cookie}; __scout_browser_session={site_id}"
         adapter = make_adapter(site["code"], site["base_url"], session_cookie=cookie)
         try:
             result = adapter.health_check()
@@ -384,7 +416,11 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
                 ("人工验证成功，公开公告列表正常", timestamp, site_id),
             )
             log_event(connection, "site.manual_verify", f"{site['name']}：人工验证成功，会话已绑定采集任务")
-        return {"ok": True, "message": "人工验证成功，已绑定该平台采集任务，可立即采集"}
+        completed = True
+        message = "人工验证成功，已绑定该平台采集任务，可立即采集"
+        if site["code"] == "chng":
+            message += "；华能采集依赖该专用窗口，请保持窗口打开"
+        return {"ok": True, "message": message}
     except ManualVerificationError as exc:
         with get_db() as connection:
             timestamp = now_iso()
@@ -400,7 +436,8 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
             log_event(connection, "site.manual_verify", f"{site['name']}：{message}", "WARNING")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
-        close_verification(site_id)
+        if completed and site["code"] != "chng":
+            close_verification(site_id)
 
 
 @app.post("/api/sites/{site_id}/accounts")

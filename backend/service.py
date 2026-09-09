@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from .adapters import AdapterError, BaseAdapter, NoticeData, first_date, make_adapter
 from .config import settings
-from .db import beijing_time, get_db, json_load, log_event, now_iso
+from .db import beijing_time, get_db, json_load, log_event, now_iso, select_site_account
 from .matching import match_sources
 from .maintenance import tracked
 from .parsers import archive_type, file_mime, is_office_lock_file, parse_document, safe_extract_zip, sha256_file
@@ -225,6 +225,12 @@ def find_site(connection, source_url: str, preferred_code: str | None = None):
     hostname = (urlparse(source_url).hostname or "").lower().rstrip(".")
     def matches(row) -> bool:
         site_hostname = (urlparse(row["base_url"]).hostname or "").lower().rstrip(".")
+        aliases = {
+            "neep": {"gd-prod.oss-cn-beijing.aliyuncs.com", "gd-prod.cn-beijing.oss.aliyuncs.com"},
+            "ceb": {"bulletin.cebpubservice.com", "ctbpsp.com", "www.ctbpsp.com"},
+        }
+        if hostname in aliases.get(row["code"], set()):
+            return True
         return bool(site_hostname and (hostname == site_hostname or hostname.endswith("." + site_hostname)))
     if preferred_code:
         row = connection.execute("SELECT * FROM sites WHERE code=?", (preferred_code,)).fetchone()
@@ -473,6 +479,10 @@ def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapte
         raw_path = save_raw_html(notice_id, data.raw_html or data.body_text)
         connection.execute("INSERT INTO notice_versions(notice_id,version_no,raw_html_path,body_text,published_at,content_fingerprint,captured_at) VALUES(?,?,?,?,?,?,?)", (notice_id, 1, raw_path, data.body_text, data.published_at, fingerprint, timestamp))
         connection.execute("UPDATE notices SET current_version=1 WHERE id=?", (notice_id,))
+    connection.execute("DELETE FROM extracted_fields WHERE notice_id=? AND field_name='collection_warning'", (notice_id,))
+    if data.collection_warning:
+        upsert_field(connection, notice_id, "collection_warning", data.collection_warning, "平台公开内容限制", 1.0)
+        log_event(connection, "notice.collection_warning", data.collection_warning, "WARNING", notice_id=notice_id, crawl_run_id=crawl_run_id)
     fields = derive_fields(data)
     for field_name, (value, location, confidence) in fields.items():
         if connection.execute("SELECT 1 FROM extracted_fields WHERE notice_id=? AND field_name=? AND manual_value IS NOT NULL", (notice_id, field_name)).fetchone():
@@ -484,6 +494,8 @@ def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapte
             connection.execute("UPDATE notices SET project_number=? WHERE id=?", (value, notice_id))
     project_name = fields["project_name"][0] or data.title
     summary = f"【项目】{project_name}；【单位】{fields['demand_unit'][0] or '待确认'}；【范围】{data.title}；【时间】{data.opening_at or '待确认'}；【附件】{len(data.attachments)} 个。"
+    if data.collection_warning:
+        summary += f"【采集限制】{data.collection_warning}。"
     connection.execute("UPDATE notices SET summary=?,ingest_status='attachments_processing',updated_at=? WHERE id=?", (summary, timestamp, notice_id))
     # Release metadata writes before potentially slow network and parsing work.
     connection.commit()
@@ -515,13 +527,13 @@ def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapte
         ensure_notice_binding_schema(connection)
         connection.execute("INSERT INTO notice_keyword_bindings(notice_id,job_id,keyword_group_id,first_run_id,last_run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(notice_id,job_id,keyword_group_id) DO UPDATE SET last_run_id=excluded.last_run_id,updated_at=excluded.updated_at", (notice_id, crawl_job_id, keyword_group_id, crawl_run_id, crawl_run_id, timestamp, timestamp))
     matched_groups = refresh_notice_analysis(connection, notice_id, data.title, data.body_text, keyword_group_id)
-    if filter_unmatched and matched_groups == 0:
+    if filter_unmatched and matched_groups == 0 and not data.collection_warning:
         if created_new:
             discard_unmatched_notice(connection, notice_id)
         return None
     attachment_rows = connection.execute("SELECT status,parse_status FROM attachments WHERE notice_id=?", (notice_id,)).fetchall()
     has_attachment_issue = any(row["status"] in ("failed", "needs_tool") or row["parse_status"] in ("failed", "unsupported", "ocr_pending") for row in attachment_rows)
-    connection.execute("UPDATE notices SET ingest_status=?,updated_at=? WHERE id=?", ("partial" if has_attachment_issue else "parsed", now_iso(), notice_id))
+    connection.execute("UPDATE notices SET ingest_status=?,updated_at=? WHERE id=?", ("partial" if has_attachment_issue or data.collection_warning else "parsed", now_iso(), notice_id))
     if created_new:
         log_event(connection, "notice.ingest", f"公告新增入库：{data.title}", notice_id=notice_id)
     elif content_changed:
@@ -534,7 +546,8 @@ def ingest_url(source_url: str, preferred_site: str | None = None) -> tuple[int,
         site = find_site(connection, source_url, preferred_site)
         if not site:
             raise AdapterError("未找到可用平台配置")
-        adapter = make_adapter(site["code"], site["base_url"])
+        account = select_site_account(connection, site["id"])
+        adapter = make_adapter(site["code"], site["base_url"], session_cookie=account["credential_ref"] if account else None)
         try:
             data = adapter.fetch_notice(source_url)
             existing = connection.execute("SELECT id FROM notices WHERE site_id IS ? AND (external_id=? OR source_url=?) ORDER BY id LIMIT 1", (site["id"], data.external_id, data.url)).fetchone()
@@ -548,10 +561,13 @@ def ingest_url(source_url: str, preferred_site: str | None = None) -> tuple[int,
 def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None, preserve_schedule_anchor: bool = False) -> None:
     with get_db() as connection:
         ensure_run_tracking_schema(connection)
-        job = connection.execute("SELECT j.*,s.code,s.base_url,a.session_status,a.credential_ref FROM crawl_jobs j JOIN sites s ON s.id=j.site_id LEFT JOIN site_accounts a ON a.id=j.account_id WHERE j.id=?", (job_id,)).fetchone()
+        job = connection.execute("SELECT j.*,s.code,s.base_url FROM crawl_jobs j JOIN sites s ON s.id=j.site_id WHERE j.id=?", (job_id,)).fetchone()
         if not job:
             return
         job = dict(job)
+        account = select_site_account(connection, job["site_id"], job["account_id"])
+        job["session_status"] = account["session_status"] if account else None
+        job["credential_ref"] = account["credential_ref"] if account else None
         for key, value in (overrides or {}).items():
             if key in {"lookback_days", "max_pages", "max_notices", "download_attachments"}:
                 job[key] = value
@@ -591,6 +607,7 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
         return
     adapter: BaseAdapter | None = None
     discovered = details = created = duplicates = filtered = attachments = parsed = failed = 0
+    pending_review = 0
     reason = None
     def record_filter(title: str, rejection: str) -> None:
         nonlocal filtered
@@ -674,13 +691,15 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
                 with get_db() as connection:
                     existing = connection.execute("SELECT id FROM notices WHERE site_id IS ? AND (external_id=? OR source_url=?) ORDER BY id LIMIT 1", (job["site_id"], data.external_id, data.url)).fetchone()
                     notice_id = ingest_notice_data(connection, job["site_id"], data, adapter, download_attachments=bool(job["download_attachments"]), keyword_group_id=job["keyword_group_id"], filter_unmatched=True, crawl_job_id=job_id, crawl_run_id=run_id)
+                    needs_review = bool(notice_id and data.collection_warning and not connection.execute("SELECT 1 FROM keyword_hits WHERE notice_id=? AND is_negative=0 LIMIT 1", (notice_id,)).fetchone())
                 if notice_id is None:
                     filtered += 1
                     continue
                 details += 1
+                pending_review += int(needs_review)
                 if existing is None:
                     created += 1
-                else:
+                elif not needs_review:
                     duplicates += 1
                 attachments += len(data.attachments)
                 parsed += 1
@@ -708,7 +727,7 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
                 connection.execute("UPDATE crawl_jobs SET last_run_at=? WHERE id=?", (now_iso(), job_id))
             else:
                 connection.execute("UPDATE crawl_jobs SET last_run_at=?,schedule_anchor_at=NULL WHERE id=?", (now_iso(), job_id))
-            log_event(connection, "crawl.finish", f"采集批次完成：发现 {discovered} 条，命中 {details} 条，新增入库 {created} 条，重复命中 {duplicates} 条，策略/关键词过滤 {filtered} 条，失败 {failed} 条", "WARNING" if reason else "INFO", crawl_run_id=run_id)
+            log_event(connection, "crawl.finish", f"采集批次完成：发现 {discovered} 条，命中 {details - pending_review} 条，新增入库 {created} 条，重复命中 {duplicates} 条，可能漏匹配保留 {pending_review} 条，策略/关键词过滤 {filtered} 条，失败 {failed} 条", "WARNING" if reason or pending_review else "INFO", crawl_run_id=run_id)
 
 
 def create_run(job_id: int) -> int:
@@ -780,5 +799,6 @@ def reparse_notice(notice_id: int) -> None:
         else:
             refresh_notice_analysis(connection, notice_id, notice["title"], version["body_text"] or "")
         issues = connection.execute("SELECT 1 FROM attachments WHERE notice_id=? AND (parse_status IN ('failed','unsupported','ocr_pending','pending') OR status IN ('failed','needs_tool','not_downloaded')) LIMIT 1", (notice_id,)).fetchone()
+        issues = issues or connection.execute("SELECT 1 FROM extracted_fields WHERE notice_id=? AND field_name='collection_warning' AND value<>'' LIMIT 1", (notice_id,)).fetchone()
         connection.execute("UPDATE notices SET ingest_status=?,updated_at=? WHERE id=?", ("partial" if issues else "parsed", now_iso(), notice_id))
         log_event(connection, "notice.reparse", f"完成重新解析：{notice['title']}", notice_id=notice_id)

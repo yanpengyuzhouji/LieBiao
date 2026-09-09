@@ -116,7 +116,7 @@ async function loadBackendNotices(resetPage = true) {
     const sync = $('#last-sync-text');
     if (sync) sync.textContent = `数据同步于 ${new Date().toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })}（北京时间）`;
     try {
-      renderCurrentView();
+      renderCurrentViewWithoutInterruptingFilters(true);
       await loadManagementData(appState.view);
     } catch (renderError) {
       console.error('页面渲染失败', renderError);
@@ -131,7 +131,7 @@ async function loadBackendNotices(resetPage = true) {
     if (count) count.textContent = '0';
     const sync = $('#last-sync-text');
     if (sync) sync.textContent = `后端未连接：${error.message}`;
-    renderCurrentView();
+    renderCurrentViewWithoutInterruptingFilters(true);
   }
 }
 
@@ -170,7 +170,7 @@ async function loadManagementData(view = appState.view) {
     appState.runs = requests[4].items || [];
     appState.dashboard = requests[5] || null;
     appState.scheduler = requests[6] || null;
-    if (appState.view === view) renderCurrentView();
+    if (appState.view === view) renderCurrentViewWithoutInterruptingFilters(false);
   } catch (error) {
     showToast(`管理数据加载失败：${error.message}`);
   }
@@ -454,7 +454,17 @@ function renderJobs() {
 }
 
 function renderLivePlatforms() {
-  return `<section class="panel-card"><div class="panel-head"><div><h3>平台与账号 <span style="color:#9da7b7;font-family:'DM Mono';font-size:10px">${appState.sites.length}</span></h3><p>遇到平台安全验证时，可打开专用窗口人工完成验证，再回到这里保存会话。</p></div></div><div class="panel-body"><table class="platform-table"><thead><tr><th>平台</th><th>采集模式</th><th>人工会话</th><th>连通状态</th><th>最近检查（北京时间）</th><th>操作</th></tr></thead><tbody>${appState.sites.map(site => { const account = (site.accounts || []).find(item => item.enabled && item.session_status === 'verified'); return `<tr><td><div class="platform-name"><span class="platform-logo ${site.code === 'csg' ? 'green' : ['sgcc', 'epec', 'cdt'].includes(site.code) ? 'orange' : ''}">${esc(site.name.slice(0, 1))}</span>${esc(site.name)}</div></td><td>公开公告（免登录）</td><td><span class="account-status" title="${esc(account ? account.status_reason || '' : '尚未保存人工验证会话')}">${account ? '已验证' : '未验证'}</span></td><td><span class="account-status" title="${esc(site.health_message || '')}">${esc(site.health_status === 'healthy' ? '正常' : site.health_status === 'unhealthy' ? '异常' : '未检查')}</span></td><td>${esc(beijingDateTime(site.last_checked_at))}</td><td><div class="row-actions-inline"><button class="batch-action" data-health-site="${site.id}">健康检查</button><button class="batch-action" data-open-verification="${site.id}">打开人工验证</button><button class="batch-action" data-complete-verification="${site.id}">验证完成</button></div></td></tr>`; }).join('')}</tbody></table></div></section>`;
+  const modes = { restricted: '访问受限 · 待完成适配', public_partial: '公开内容 · 部分内容受限' };
+  const scopeNotes = { chnenergy: '招标公告：货物、工程、服务；不包含询价采购。', chng: '使用新版招标公告接口；采集时需保持专用窗口打开。', chdtp: '仅采集招标公告；安全验证后再采集。', yfb: '登录企业会员后进入信息中心，复用登录会话采集完整公告。', ceb: '列表可直接读取，详情需要每次交互验证码，当前暂不能完整采集。', espic: '指定招标列表仍返回 WEB 应用防火墙，需人工滑块后继续适配。' };
+  return `<section class="panel-card"><div class="panel-head"><div><h3>平台与账号 <span style="color:#9da7b7;font-family:'DM Mono';font-size:10px">${appState.sites.length}</span></h3><p>可打开专用窗口人工验证后保存会话。会员权限、跨域验证码或网站黑名单不保证能通过保存会话解决，请以健康检查为准。</p></div></div><div class="panel-body"><table class="platform-table"><thead><tr><th>平台</th><th>采集模式</th><th>人工会话</th><th>连通状态</th><th>最近检查（北京时间）</th><th>操作</th></tr></thead><tbody>${appState.sites.map(site => {
+    const account = (site.accounts || []).find(item => item.enabled && item.session_status === 'verified');
+    const needsVerification = ['chng', 'cdt', 'chdtp', 'espic', 'yfb'].includes(site.code);
+    const publicReady = !needsVerification;
+    const sessionText = account ? '已验证' : publicReady ? '无需验证' : '未验证';
+    const sessionTitle = account ? account.status_reason || '' : publicReady ? '使用公开采集入口，可用性以健康检查为准' : '尚未保存人工验证会话';
+    const verificationActions = needsVerification ? `<button class="batch-action" data-open-verification="${site.id}">打开人工验证</button><button class="batch-action" data-complete-verification="${site.id}">验证完成</button>` : '';
+    return `<tr><td><div class="platform-name"><span class="platform-logo ${site.code === 'csg' ? 'green' : ['sgcc', 'epec', 'cdt'].includes(site.code) ? 'orange' : ''}">${esc(site.name.slice(0, 1))}</span>${esc(site.name)}</div></td><td>${esc(modes[site.public_mode] || '公开公告（免登录）')}<div style="font-size:11px;color:#69758e">${esc(scopeNotes[site.code] || '')}</div></td><td><span class="account-status" title="${esc(sessionTitle)}">${sessionText}</span></td><td><span class="account-status" title="${esc(site.health_message || '')}">${esc(site.health_status === 'healthy' ? '正常' : site.health_status === 'unhealthy' ? '异常' : '未检查')}</span></td><td>${esc(beijingDateTime(site.last_checked_at))}</td><td><div class="row-actions-inline"><button class="batch-action" data-health-site="${site.id}">健康检查</button>${verificationActions}</div></td></tr>`;
+  }).join('')}</tbody></table></div></section>`;
 }
 
 function renderPlatforms() {
@@ -506,6 +516,23 @@ function renderCurrentView() {
   container.innerHTML = viewRenderers[appState.view]();
   if (appState.view === 'notices') renderNoticeTable();
   if (appState.view === 'imports') loadStorageSettings();
+}
+
+function noticeFilterIsActive() {
+  const active = document.activeElement;
+  return appState.view === 'notices'
+    && active instanceof HTMLElement
+    && active.matches('#notice-search, #platform-filter, #mark-filter, #attachment-filter');
+}
+
+function renderCurrentViewWithoutInterruptingFilters(refreshNoticeTable = false) {
+  // Crawl status is polled every few seconds. Replacing #view-container while a
+  // native select is open disconnects the element and makes the dropdown close.
+  if (noticeFilterIsActive()) {
+    if (refreshNoticeTable) renderNoticeTable();
+    return;
+  }
+  renderCurrentView();
 }
 
 function setView(view) {

@@ -13,9 +13,11 @@ python3 -m pip install -r requirements.txt
 python3 run_app.py
 ```
 
-程序会自动打开 `http://127.0.0.1:8090`。API 文档位于 `http://127.0.0.1:8090/api/docs`。
+程序会自动打开 `http://127.0.0.1:8091`。API 文档位于 `http://127.0.0.1:8091/api/docs`。
 
 Windows 上建议使用 `py run_app.py` 启动。打包时在 Windows 开发机执行 `packaging\\build_windows.bat`，产物位于 `dist\\LieBiao\\LieBiao.exe`。
+
+Windows 打包版启动后会在右下角创建托盘图标；关闭主窗口只会隐藏到托盘，托盘菜单可打开系统、打开数据目录、检查版本更新或退出系统。只有选择“退出系统”才会停止定时采集。
 
 旧版 `.doc` 解析依赖目标电脑安装 Microsoft Word；`.docx`、`.xlsx` 和文本型 PDF 的解析组件已随程序打包。
 

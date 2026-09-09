@@ -112,6 +112,7 @@ def main():
         server.run();return
     import tkinter as tk
     from tkinter import messagebox
+    from backend.tray import WindowsTray
     window=tk.Tk();window.title('猎标 · 招标公告采集系统');window.geometry('540x230');window.resizable(False,False)
     label=tk.StringVar(value='正在启动本地服务…')
     tk.Label(window,text='猎标 · 招标公告采集系统',font=('Microsoft YaHei UI',16)).pack(pady=(20,10))
@@ -119,11 +120,15 @@ def main():
     tk.Label(window,text=f'数据目录：{settings.data_dir}',wraplength=500).pack(pady=8)
     url=f'http://127.0.0.1:{port}'
     tk.Button(window,text='打开系统',command=lambda:webbrowser.open(url)).pack(pady=8)
+    tray = WindowsTray(window, settings.data_dir, lambda: exit_app())
+    tray_active = tray.start()
+    if not tray_active:
+        logging.warning('Windows notification-area icon is unavailable; using the taskbar window')
     worker=threading.Thread(target=server.run,daemon=True);worker.start()
     deadline=time.monotonic()+60
     def ready():
         if server.started:
-            label.set('运行中。最小化此窗口可继续定时采集；关闭窗口将退出服务。')
+            label.set('运行中。关闭窗口将隐藏到右下角；从托盘退出才会停止定时采集。')
             (config_dir/'desktop-state.json').write_text(json.dumps({'port':port}),encoding='utf-8')
             if not args.no_browser: webbrowser.open(url)
         elif time.monotonic()>deadline or not worker.is_alive():
@@ -131,6 +136,7 @@ def main():
         else: window.after(300,ready)
     def exit_app():
         if not messagebox.askyesno('退出系统','退出后将停止定时采集。确认退出吗？'): return
+        tray.destroy()
         server.should_exit=True
         label.set('正在等待当前请求结束…')
         def stopped():
@@ -138,7 +144,7 @@ def main():
             else: window.destroy()
         stopped()
     tk.Button(window,text='退出系统',command=exit_app).pack(pady=2)
-    window.protocol('WM_DELETE_WINDOW',window.iconify)
+    window.protocol('WM_DELETE_WINDOW',tray.hide_window if tray_active else window.iconify)
     window.after(300,ready);window.mainloop()
 
 

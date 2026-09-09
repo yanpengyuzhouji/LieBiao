@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -7,6 +8,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
@@ -47,6 +49,7 @@ class NoticeData:
     opening_at: str | None = None
     notice_type: str = "招标公告"
     attachments: list[AttachmentInfo] = field(default_factory=list)
+    collection_warning: str | None = None
 
 
 class PageParser(HTMLParser):
@@ -190,6 +193,7 @@ class BaseAdapter:
         self._request_interval_seconds = 0.0
         self._last_request_started: float | None = None
         self._request_lock = threading.Lock()
+        self.browser_site_id: int | None = None
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "Accept": "text/html,application/json,application/xhtml+xml,*/*;q=0.8",
@@ -200,7 +204,18 @@ class BaseAdapter:
             for item in session_cookie.split(";"):
                 if "=" in item:
                     key, value = item.strip().split("=", 1)
-                    cookies[key] = value
+                    if key == "__scout_user_agent":
+                        try:
+                            headers["User-Agent"] = base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8")
+                        except (ValueError, UnicodeDecodeError):
+                            pass
+                    elif key == "__scout_browser_session":
+                        try:
+                            self.browser_site_id = int(value)
+                        except ValueError:
+                            pass
+                    else:
+                        cookies[key] = value
         self.proxy_url = detect_outbound_proxy()
         self.client = httpx.Client(
             timeout=timeout,
@@ -527,7 +542,7 @@ class EpecAdapter(BaseAdapter):
 
 class ChngAdapter(BaseAdapter):
     code = "chng"
-    legacy_root = "https://ec.chng.com.cn/ecmall/"
+    api_root = "https://ec.chng.com.cn/scm-uiaoauth-web/s/business/uiaouth/"
 
     def health_check(self) -> dict[str, Any]:
         try:
@@ -542,51 +557,73 @@ class ChngAdapter(BaseAdapter):
         if not query and "?" in urlparse(url).fragment:
             query = parse_qs(urlparse(url).fragment.split("?", 1)[1])
         notice_id = (query.get("id") or query.get("announcementId") or [""])[0]
-        return f"https://ec.chng.com.cn/ecmall/announcement/announcementDetailTender.do?announcementId={notice_id}" if notice_id else url
+        return f"https://ec.chng.com.cn/channel/home/#/detail?id={notice_id}" if notice_id else url
+
+    def _json(self, path: str, method: str = "GET", payload: dict | None = None) -> dict[str, Any]:
+        url = urljoin(self.api_root, path)
+        if self.browser_site_id:
+            from .manual_verification import ManualVerificationError, browser_request
+            try:
+                return browser_request(self.browser_site_id, url, method, payload)
+            except ManualVerificationError as exc:
+                raise AdapterError(str(exc)) from exc
+        response = self.client.request(method, url, json=payload, headers={"Referer": self.base_url})
+        if response.status_code == 412 or "$_ts" in response.text:
+            raise AdapterError("中国华能要求使用专用浏览器采集，请打开人工验证窗口并保持窗口运行")
+        response.raise_for_status()
+        return response.json()
 
     def list_notices(self, max_pages: int = 1, max_notices: int = 100, list_url: str | None = None, exclude_external_ids: set[str] | None = None) -> list[NoticeSummary]:
-        entry = list_url or f"{self.legacy_root}more.do?type=101"
+        del list_url
         result: list[NoticeSummary] = []
         excluded = exclude_external_ids or set()
+        seen: set[str] = set()
+        recognized = False
         for page in range(1, max_pages + 1):
-            separator = "&" if "?" in entry else "?"
-            response = self.client.get(f"{entry}{separator}page={page}")
-            if response.status_code == 412:
-                raise AdapterError("中国华能列表触发平台安全验证，未将验证页作为公告入库")
-            response.raise_for_status()
-            parser = PageParser()
-            parser.feed(response.text)
+            payload = self._json("queryAnnouncementByTitle", "POST", {"type": "103", "start": (page - 1) * 10, "limit": 10})
             found = 0
-            for href, label in parser.links:
-                match = re.search(r"announcementDetailTender\.do\?announcementId=(\d+)", href or "")
-                if not match or not label.strip():
+            rows = payload.get("root") or []
+            for row in rows:
+                notice_id = str(row.get("announcementId") or "")
+                title = str(row.get("announcementTitle") or "").strip()
+                if not notice_id or not title:
                     continue
+                recognized = True
+                if notice_id in seen:
+                    continue
+                seen.add(notice_id)
                 found += 1
-                notice_id = match.group(1)
                 if notice_id in excluded:
                     continue
-                result.append(NoticeSummary(notice_id, label.strip(), urljoin(entry, href)))
+                created = row.get("createtime")
+                published = datetime.fromtimestamp(created / 1000, timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S") if isinstance(created, (int, float)) else None
+                result.append(NoticeSummary(notice_id, title, f"https://ec.chng.com.cn/channel/home/#/detail?id={notice_id}", published_at=published))
                 if len(result) >= max_notices:
                     return result
-            if not found:
+            if not found or len(rows) < 10:
                 break
-        if not result:
+        if not result and not recognized:
             raise AdapterError("中国华能公开公告列表未返回可识别数据")
         return result
 
     def fetch_notice(self, url: str, external_id: str | None = None, detail_id: str | None = None) -> NoticeData:
         del detail_id
         public_url = self.public_detail_url(url)
-        notice = super().fetch_notice(public_url, external_id=external_id)
-        title_match = re.search(r"详情页\s*\n\s*(.+?)\s*\n\s*来源[：:]", notice.body_text)
-        if title_match:
-            notice.title = title_match.group(1).strip()
-            if "中标" in notice.title:
-                notice.notice_type = "中标公示"
-            elif "采购" in notice.title:
-                notice.notice_type = "采购公告"
-        notice.url = url
-        return notice
+        notice_id = external_id or (parse_qs(urlparse(public_url).fragment.split("?", 1)[1]).get("id") or [""])[0]
+        payload = self._json("announcementDetail?" + urlencode({"announcementId": notice_id}))
+        announcement = ((payload.get("data") or {}).get("announcement") or {})
+        raw = str(announcement.get("announcementHtml") or "")
+        title = str(announcement.get("announcementTitle") or "").strip()
+        if not raw or not title:
+            raise AdapterError("中国华能公告详情接口未返回完整正文")
+        parser = PageParser()
+        parser.feed(raw)
+        body = clean_text(parser.text_parts)
+        created = announcement.get("createtime")
+        published = datetime.fromtimestamp(created / 1000, timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S") if isinstance(created, (int, float)) else first_date(body, ("发布时间", "发布日期"))
+        return NoticeData(str(notice_id), title, public_url, body, raw, published_at=published,
+                          opening_at=first_date(body, ("开标时间", "投标截止时间", "递交截止时间")),
+                          notice_type="招标公告", attachments=self._attachments_from_links(parser.links, public_url))
 
 
 class CdtAdapter(BaseAdapter):
@@ -604,6 +641,8 @@ class CdtAdapter(BaseAdapter):
         del list_url
         result: list[NoticeSummary] = []
         excluded = exclude_external_ids or set()
+        seen: set[str] = set()
+        recognized = False
         page_size = min(50, max_notices)
         for page in range(1, max_pages + 1):
             data = {"page": page, "limit": page_size, "messagetype": "0", "startDate": "", "endDate": ""}
@@ -618,10 +657,18 @@ class CdtAdapter(BaseAdapter):
             except (httpx.HTTPError, ValueError) as exc:
                 raise AdapterError(f"大唐集团公告列表访问失败：{exc}") from exc
             rows = payload.get("data") or []
+            page_found = 0
             for row in rows:
                 notice_id = str(row.get("id") or "")
                 title = str(row.get("message_title") or "").strip()
-                if not notice_id or not title or notice_id in excluded:
+                if not notice_id or not title:
+                    continue
+                recognized = True
+                if notice_id in seen:
+                    continue
+                seen.add(notice_id)
+                page_found += 1
+                if notice_id in excluded:
                     continue
                 result.append(NoticeSummary(
                     notice_id, title,
@@ -630,9 +677,9 @@ class CdtAdapter(BaseAdapter):
                 ))
                 if len(result) >= max_notices:
                     return result
-            if len(rows) < page_size:
+            if not page_found or len(rows) < page_size:
                 break
-        if not result:
+        if not result and not recognized:
             raise AdapterError("大唐集团公开公告列表未返回可识别数据")
         return result
 
@@ -684,5 +731,7 @@ ADAPTERS = {
 
 
 def make_adapter(code: str, base_url: str, session_cookie: str | None = None) -> BaseAdapter:
-    adapter_class = ADAPTERS.get(code, BaseAdapter)
+    from .public_platforms import PUBLIC_ADAPTERS
+
+    adapter_class = ADAPTERS.get(code) or PUBLIC_ADAPTERS.get(code, BaseAdapter)
     return adapter_class(base_url, session_cookie=session_cookie)

@@ -427,6 +427,10 @@ def process_local_attachment(connection, notice_id: int, attachment_id: int, pat
             connection.commit()
             destination = extraction_directory(notice_id) / safe_name(path.stem)
             extracted = safe_extract_zip(path, destination, settings.max_archive_mb * 1024 * 1024, settings.max_expanded_mb * 1024 * 1024, settings.max_archive_files, settings.max_archive_depth)
+            if not connection.execute(
+                "SELECT 1 FROM attachments WHERE id=? AND notice_id=?", (attachment_id, notice_id)
+            ).fetchone():
+                return sources
             connection.execute("UPDATE attachments SET status='extracted',parse_status='parsed',error_message=NULL WHERE id=?", (attachment_id,))
             for child in extracted:
                 child_name = child.relative_to(destination).as_posix()
@@ -446,6 +450,10 @@ def process_local_attachment(connection, notice_id: int, attachment_id: int, pat
     # Parsing may call Word for tens of seconds; release SQLite's writer first.
     connection.commit()
     result = parse_document(path)
+    if not connection.execute(
+        "SELECT 1 FROM attachments WHERE id=? AND notice_id=?", (attachment_id, notice_id)
+    ).fetchone():
+        return sources
     if result.status == "parsed":
         connection.execute("DELETE FROM extracted_documents WHERE attachment_id=?", (attachment_id,))
     if result.status == "parsed" or not connection.execute("SELECT 1 FROM extracted_documents WHERE attachment_id=?", (attachment_id,)).fetchone():

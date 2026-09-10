@@ -12,7 +12,8 @@ from backend.adapters import NoticeData
 from backend.config import settings
 from backend.db import get_db, init_db, now_iso
 from backend.main import app, list_notices, site_health_check
-from backend.service import attachment_tree_needs_reparse, create_attachment, find_site, ingest_notice_data, permanently_delete_notices, refresh_notice_analysis, try_create_run
+from backend.parsers import DocumentResult
+from backend.service import attachment_tree_needs_reparse, create_attachment, find_site, ingest_notice_data, permanently_delete_notices, process_local_attachment, refresh_notice_analysis, try_create_run
 from backend.stabilization_migration import migrate_stabilization_schema
 from backend.storage import save_raw_html
 
@@ -86,6 +87,26 @@ class StabilityIntegrationTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertTrue((settings.data_dir / first).exists())
         self.assertTrue((settings.data_dir / second).exists())
+
+    def test_attachment_removed_while_parser_runs_does_not_write_stale_foreign_key(self) -> None:
+        path = settings.temp_dir / "concurrent.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("附件内容", encoding="utf-8")
+        with get_db() as connection:
+            notice_id = ingest_notice_data(
+                connection, 1, NoticeData("concurrent-attachment", "并发附件公告", "https://example.com/concurrent", "正文"),
+                download_attachments=False,
+            )
+            attachment_id = create_attachment(connection, notice_id, "concurrent.txt", None, "stored")
+
+            def remove_during_parse(_path):
+                connection.execute("DELETE FROM attachments WHERE id=?", (attachment_id,))
+                connection.commit()
+                return DocumentResult(text="附件内容", parser="text", status="parsed")
+
+            with patch("backend.service.parse_document", side_effect=remove_during_parse):
+                self.assertEqual(process_local_attachment(connection, notice_id, attachment_id, path, path.name), [])
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_manual_import_promotes_existing_crawl_notice(self) -> None:
         with get_db() as connection:

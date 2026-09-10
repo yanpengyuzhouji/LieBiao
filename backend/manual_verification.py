@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import httpx
 from websockets.sync.client import connect
@@ -134,7 +134,9 @@ def _cookie_header(cookies: list[dict[str, object]], host: str) -> str:
 
 
 def browser_request(site_id: int, url: str, method: str = "GET", payload: dict | None = None,
-                    port: int | None = None) -> dict:
+                    port: int | None = None, form_encoded: bool = False,
+                    parse_json: bool = True,
+                    storage_query: dict[str, str] | None = None) -> dict | str:
     """Run a same-origin public request inside an open verified Edge page."""
     with _lock:
         session = _sessions.get(site_id)
@@ -142,7 +144,7 @@ def browser_request(site_id: int, url: str, method: str = "GET", payload: dict |
     if not session and port:
         session = _attach_session(site_id, port, expected_host)
     if not session or not _process_alive(session.process) and session.process is not None:
-        raise ManualVerificationError("华能专用采集窗口已关闭，请在“平台与账号”重新打开后采集")
+        raise ManualVerificationError("专用采集窗口已关闭，请在“平台与账号”重新打开后采集")
     if expected_host != session.host:
         raise ManualVerificationError("浏览器采集请求地址与验证平台不一致")
     targets = httpx.get(f"http://127.0.0.1:{session.port}/json", timeout=3).json()
@@ -150,12 +152,21 @@ def browser_request(site_id: int, url: str, method: str = "GET", payload: dict |
                    and item.get("webSocketDebuggerUrl")
                    and (urlparse(item.get("url", "")).hostname or "").lower() == session.host), None)
     if not target:
-        raise ManualVerificationError("未找到华能公告页面，请保持专用窗口打开")
-    options = {"method": method.upper(), "credentials": "include", "headers": {"Content-Type": "application/json"}}
+        raise ManualVerificationError("未找到平台公告页面，请保持专用窗口打开")
+    content_type = "application/x-www-form-urlencoded;charset=UTF-8" if form_encoded else "application/json"
+    options = {"method": method.upper(), "credentials": "include", "headers": {"Content-Type": content_type}}
     if payload is not None:
-        options["body"] = json.dumps(payload, ensure_ascii=False)
+        options["body"] = urlencode(payload, doseq=True) if form_encoded else json.dumps(payload, ensure_ascii=False)
+    request_url = json.dumps(url)
+    if storage_query:
+        request_url = (
+            "(()=>{const u=new URL(" + request_url + ");const q="
+            + json.dumps(storage_query, ensure_ascii=False)
+            + ";for(const [p,k] of Object.entries(q)){const v=localStorage.getItem(k);if(v)u.searchParams.set(p,v)}"
+            + "return u.toString()})()"
+        )
     expression = (
-        "(async()=>{const r=await fetch(" + json.dumps(url) + "," + json.dumps(options, ensure_ascii=False)
+        "(async()=>{const r=await fetch(" + request_url + "," + json.dumps(options, ensure_ascii=False)
         + ");return JSON.stringify({status:r.status,text:await r.text()})})()"
     )
     with connect(target["webSocketDebuggerUrl"], origin=f"http://127.0.0.1:{session.port}", open_timeout=5) as websocket:
@@ -166,12 +177,13 @@ def browser_request(site_id: int, url: str, method: str = "GET", payload: dict |
             if response.get("id") != 1:
                 continue
             if response.get("exceptionDetails"):
-                raise ManualVerificationError("华能浏览器请求执行失败，请刷新公告页后重试")
+                raise ManualVerificationError("浏览器采集请求执行失败，请刷新公告页后重试")
             value = (((response.get("result") or {}).get("result") or {}).get("value"))
             result = json.loads(value or "{}")
             if result.get("status") != 200:
-                raise ManualVerificationError(f"华能浏览器请求返回 {result.get('status') or '未知状态'}")
-            return json.loads(result.get("text") or "{}")
+                raise ManualVerificationError(f"浏览器采集请求返回 {result.get('status') or '未知状态'}")
+            text = result.get("text") or ""
+            return json.loads(text or "{}") if parse_json else text
 
 
 def complete_verification(site_id: int, port: int | None = None) -> str:

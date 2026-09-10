@@ -34,7 +34,7 @@ from .update_checker import update_monitor
 from .manual_verification import ManualVerificationError, browser_session_port, close_verification, complete_verification, open_verification
 
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 app = FastAPI(title="猎标 V1 API", version=APP_VERSION, docs_url="/api/docs", redoc_url=None)
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 
@@ -132,6 +132,12 @@ class RunJobRequest(BaseModel):
     max_pages: int | None = Field(default=None, ge=1, le=100)
     max_notices: int | None = Field(default=None, ge=1, le=10000)
     download_attachments: bool | None = None
+
+
+class RunAllJobsRequest(BaseModel):
+    lookback_days: int | None = Field(default=None, ge=0, le=3650)
+    max_pages: int | None = Field(default=None, ge=1, le=100)
+    max_notices: int | None = Field(default=None, ge=1, le=10000)
 
 
 def validate_id(value: int, label: str = "记录") -> None:
@@ -332,6 +338,8 @@ def open_site_verification(site_id: int) -> dict[str, Any]:
             verification_url = "https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/search"
         elif site["code"] == "espic":
             verification_url = "https://ebid.espic.com.cn/newgdtcms//category/bulletinListNew.html?dates=300&categoryId=2&tenderMethod=01&tabName=%E6%8B%9B%E6%A0%87%E4%BF%A1%E6%81%AF&page=1"
+        elif site["code"] == "chdtp":
+            verification_url = "https://www.chdtp.com/pages/wzglS/cgxx/caigou.jsp?cgtype=4"
         result = open_verification(site_id, verification_url, settings.data_dir / "browser_sessions")
         # Keep the local debug port in the account record immediately. This is
         # what lets the API reconnect to an Edge window after an app restart,
@@ -422,7 +430,7 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
                 completed = True
                 return {"ok": True, "mode": "public", "message": message}
             raise ManualVerificationError(f"{session_error}；公开采集检查也未通过：{public_result['message']}") from session_error
-        if site["code"] in ("chng", "yfb"):
+        if site["code"] in ("chng", "cdt", "yfb", "chdtp"):
             cookie = f"{cookie}; __scout_browser_session={site_id}"
         adapter = make_adapter(site["code"], site["base_url"], session_cookie=cookie)
         try:
@@ -456,8 +464,8 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
             log_event(connection, "site.manual_verify", f"{site['name']}：人工验证成功，会话已绑定采集任务")
         completed = True
         message = "人工验证成功，已绑定该平台采集任务，可立即采集"
-        if site["code"] == "chng":
-            message += "；华能采集依赖该专用窗口，请保持窗口打开"
+        if site["code"] in ("chng", "cdt", "yfb", "chdtp"):
+            message += "；该平台定时采集依赖专用窗口，请保持窗口打开"
         return {"ok": True, "message": message}
     except ManualVerificationError as exc:
         with get_db() as connection:
@@ -474,7 +482,7 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
             log_event(connection, "site.manual_verify", f"{site['name']}：{message}", "WARNING")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
-        if completed and site["code"] != "chng":
+        if completed and site["code"] not in ("chng", "cdt", "yfb", "chdtp"):
             close_verification(site_id)
 
 
@@ -670,6 +678,42 @@ def delete_job(job_id: int) -> dict[str, Any]:
         connection.execute("DELETE FROM crawl_jobs WHERE id=?", (job_id,))
         log_event(connection, "job.delete", f"删除采集任务：{row['name']}")
     return {"ok": True}
+
+
+@app.post("/api/crawl-jobs/run-all")
+def run_all_jobs(background_tasks: BackgroundTasks, payload: RunAllJobsRequest | None = None) -> dict[str, Any]:
+    with get_db() as connection:
+        jobs = connection.execute(
+            "SELECT j.id,j.name,j.keyword_group_id,g.enabled AS keyword_enabled "
+            "FROM crawl_jobs j LEFT JOIN keyword_groups g ON g.id=j.keyword_group_id "
+            "WHERE j.enabled=1 ORDER BY j.id"
+        ).fetchall()
+    if not jobs:
+        raise HTTPException(status_code=409, detail="没有已启用的采集任务")
+
+    overrides = payload.model_dump(exclude_none=True) if payload else {}
+    started = []
+    skipped = []
+    for job in jobs:
+        job_id = int(job["id"])
+        if job["keyword_group_id"] and not job["keyword_enabled"]:
+            skipped.append({"job_id": job_id, "job_name": job["name"], "reason": "绑定的关键词组已停用"})
+            continue
+        run_id = try_create_run(job_id, reset_schedule=True)
+        if run_id is None:
+            skipped.append({"job_id": job_id, "job_name": job["name"], "reason": "已有采集批次正在运行"})
+            continue
+        background_tasks.add_task(run_crawl, job_id, run_id, overrides, True)
+        started.append({"job_id": job_id, "job_name": job["name"], "run_id": run_id})
+
+    message = f"已将 {len(started)} 个任务加入采集队列" if started else "没有可启动的新任务"
+    if skipped:
+        message += f"，跳过 {len(skipped)} 个任务"
+    with get_db() as connection:
+        log_event(connection, "crawl.run_all", message)
+        for item in skipped:
+            log_event(connection, "crawl.run_all.skip", f"批量采集跳过 {item['job_name']}：{item['reason']}", "WARNING")
+    return {"started": started, "skipped": skipped, "message": message}
 
 
 @app.post("/api/crawl-jobs/{job_id}/run")

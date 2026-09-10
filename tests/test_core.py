@@ -215,6 +215,26 @@ class AdapterParsingTests(unittest.TestCase):
         self.assertEqual(len(notice.attachments), 1)
         self.assertEqual(notice.attachments[0].url, "https://bid.cdt-ec.com/dtdzzb/cgUploadController.do?downLoadFileOut&extend=pdf&objId=abc123")
 
+    def test_cdt_verified_session_routes_list_and_detail_through_browser(self) -> None:
+        adapter = CdtAdapter.__new__(CdtAdapter)
+        adapter.base_url = "https://tang.cdt-ec.com/"
+        adapter.list_api = "https://tang.cdt-ec.com/notice/moreController/getList"
+        adapter.browser_site_id = 18
+        adapter.browser_port = 43210
+        detail_html = '<html><h1>风机招标公告</h1><div class="content">发布时间：2026-09-09</div></html>'
+        with unittest.mock.patch(
+            'backend.manual_verification.browser_request',
+            side_effect=[
+                {"data": [{"id": "1881920", "message_title": "风机招标公告", "publish_time": "2026-09-09"}]},
+                detail_html,
+            ],
+        ) as browser:
+            rows = adapter.list_notices()
+            notice = adapter.fetch_notice(rows[0].url, rows[0].external_id)
+        self.assertEqual(notice.title, "风机招标公告")
+        self.assertTrue(browser.call_args_list[0].kwargs["form_encoded"])
+        self.assertFalse(browser.call_args_list[1].kwargs["parse_json"])
+
     def test_chng_rewrites_hash_detail_to_public_html(self) -> None:
         adapter = ChngAdapter.__new__(ChngAdapter)
         self.assertEqual(

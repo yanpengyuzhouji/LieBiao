@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
@@ -107,6 +108,8 @@ class PublicAdapter(BaseAdapter):
 
 class YfbAdapter(PublicAdapter):
     code = "yfb"
+    enterprise_list_url = "https://qiye.qianlima.com/new_qd_yfbsite/api/search"
+    public_detail_url = "https://www.yfbzb.com/inviteBid/detail/{date}_{external_id}.html"
 
     def list_notices(self, max_pages=1, max_notices=100, list_url=None, exclude_external_ids=None):
         if getattr(self, "browser_site_id", None):
@@ -149,42 +152,51 @@ class YfbAdapter(PublicAdapter):
     def _list_verified_enterprise(self, max_pages, max_notices, exclude_external_ids=None):
         result, seen = [], set()
         excluded = exclude_external_ids or set()
-        parsed = urlparse(self.base_url)
-        endpoint = parsed._replace(path="/yfbsite/mesinfo/zbpglist", params="", query="", fragment="").geturl()
         for page in range(1, max_pages + 1):
             try:
-                response = self.client.post(
-                    endpoint,
-                    data={"siteId": self.browser_site_id, "pageNo": page, "pageSize": max_notices},
+                from .manual_verification import ManualVerificationError, browser_request
+                query = urlencode({
+                    "pageSize": 30, "pageNum": page, "pageFrom": "zhaobiao",
+                    "keyword": "", "filterCondition": 1, "searchType": "1", "timeOption": "2",
+                    "viewMonitor": "false", "defTimeFlag": "0",
+                })
+                payload = browser_request(
+                    self.browser_site_id, f"{self.enterprise_list_url}?{query}",
+                    port=self.browser_port, storage_query={"openid": "YFB-OpenId"},
                 )
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
+            except ManualVerificationError as exc:
                 raise AdapterError(f"乙方宝企业公告列表访问失败：{exc}") from exc
-            raw = response.text
-            for row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", raw, re.S | re.I):
-                parser = PageParser()
-                parser.feed(row)
-                text = clean_text(parser.text_parts)
-                match = re.search(r"popUpQRcodeImg\s*\(\s*['\"](\d+)", row)
-                if not match:
+            if not isinstance(payload, dict) or payload.get("code") != 200:
+                message = payload.get("msg") if isinstance(payload, dict) else "响应格式异常"
+                raise AdapterError(f"乙方宝企业公告列表访问失败：{message or '登录会话无效'}")
+            rows = (payload.get("data") or {}).get("resultList") or []
+            progress = False
+            for row in rows:
+                external_id = str(row.get("contentId") or "").strip()
+                title = clean_text([str(row.get("title") or "")])
+                if not external_id or not title:
                     continue
-                external_id = match.group(1)
                 if external_id in seen:
                     continue
                 seen.add(external_id)
-                title = next((label.strip() for _, label in parser.links if label.strip()), "")
-                if external_id in excluded or "招标" not in title:
+                progress = True
+                if external_id in excluded or row.get("type") != "招标公告":
                     continue
-                dates = re.findall(r"20\d{2}-\d{2}-\d{2}", text)
+                dates = re.findall(r"20\d{2}-\d{2}-\d{2}", str(row.get("updateTime") or ""))
+                if not dates:
+                    continue
+                published_at = dates[0]
                 result.append(NoticeSummary(
                     external_id, title,
-                    f"{parsed.scheme}://{parsed.netloc}/infoCenter/infoDetail/{external_id}/2703/zhaobiao",
-                    dates[0] if dates else None, "招标公告",
+                    self.public_detail_url.format(date=published_at.replace("-", ""), external_id=external_id),
+                    published_at, "招标公告",
                 ))
                 if len(result) >= max_notices:
                     return result
-            if not result and page == 1:
+            if not rows and page == 1:
                 raise AdapterError("乙方宝企业公告列表未识别到招标公告，请检查登录限制或页面变化")
+            if not progress:
+                break
         return result
 
     def fetch_notice(self, url, external_id=None, detail_id=None):
@@ -477,19 +489,31 @@ class EspicAdapter(PublicAdapter):
 class ChdtpAdapter(PublicAdapter):
     code = "chdtp"
     ROOT = "https://www.chdtp.com/"
-    LIST_URL = urljoin(ROOT, "staticPage/zxzbggJT.html")
+    LIST_URL = urljoin(ROOT, "pages/wzglS/cgxx/caigou.jsp?cgtype=4")
+    DATA_URL = urljoin(ROOT, "webs/queryWebZbgg.action?zbggType=1")
 
     @staticmethod
     def _blocked(response):
         text = response.text
         return response.status_code == 412 or "/sgodapt2y.js" in text or "l='d'" in text[:2000]
 
-    def _page(self, url):
-        response = self.client.get(url, headers={"Referer": self.base_url})
+    def _page(self, url, method="GET", payload=None):
+        if getattr(self, "browser_site_id", None):
+            try:
+                from .manual_verification import ManualVerificationError, browser_request
+                return browser_request(
+                    self.browser_site_id, url, method, payload, port=self.browser_port,
+                    form_encoded=payload is not None, parse_json=False,
+                )
+            except ManualVerificationError as exc:
+                raise AdapterError(f"中国华电专用浏览器访问失败：{exc}") from exc
+        response = self.client.request(
+            method, url, data=payload, headers={"Referer": self.LIST_URL},
+        )
         if self._blocked(response):
             raise AdapterError("中国华电平台触发安全验证，请在“平台与账号”完成人工验证后再采集")
         response.raise_for_status()
-        return response
+        return response.text
 
     def health_check(self):
         try:
@@ -499,29 +523,32 @@ class ChdtpAdapter(PublicAdapter):
             return {"ok": False, "status_code": None, "message": str(exc)}
 
     def list_notices(self, max_pages=1, max_notices=100, list_url=None, exclude_external_ids=None):
-        entry = list_url or self.LIST_URL
+        entry = list_url or self.DATA_URL
         if (urlparse(entry).hostname or "").lower() != "www.chdtp.com":
             raise AdapterError("中国华电列表地址不属于官方平台")
-        result, seen, visited = [], set(), set()
+        result, seen = [], set()
         excluded = exclude_external_ids or set()
-        url = entry
-        for _ in range(max_pages):
-            if url in visited:
-                break
-            visited.add(url)
-            raw = self._page(url).text
-            parser = PageParser()
-            parser.feed(raw)
+        for page in range(1, max_pages + 1):
+            payload = None if page == 1 else {"zbggType": "1", "page.currentpage": page}
+            raw = self._page(entry, "POST" if payload else "GET", payload)
             progress = False
-            next_url = None
-            for href, label in parser.links:
-                absolute = urljoin(url, href)
+            recognized = False
+            for attrs, inner in re.findall(r"<a\b([^>]*)>(.*?)</a>", raw, re.S | re.I):
+                href_match = re.search(r"\bhref\s*=\s*([\"'])(.*?)\1", attrs, re.S | re.I)
+                if not href_match:
+                    continue
+                href = unescape(href_match.group(2)).strip()
+                script_path = re.search(r"toGetContent\(\s*['\"]([^'\"]+)['\"]\s*\)", href, re.I)
+                if script_path:
+                    absolute = urljoin(self.ROOT, "staticPage/" + script_path.group(1).lstrip("/"))
+                else:
+                    absolute = urljoin(entry, href)
                 parsed = urlparse(absolute)
-                if label.strip() in ("下一页", "下页", ">", "›"):
-                    next_url = absolute
+                title_match = re.search(r"\btitle\s*=\s*([\"'])(.*?)\1", attrs, re.S | re.I)
+                label = unescape(title_match.group(2) if title_match else re.sub(r"<[^>]+>", "", inner)).strip()
+                if parsed.hostname != "www.chdtp.com" or not label or "招标" not in label:
                     continue
-                if parsed.hostname != "www.chdtp.com" or not label.strip() or "招标公告" not in label:
-                    continue
+                recognized = True
                 key = extract_chdtp_id(absolute)
                 if not key or key in seen:
                     continue
@@ -534,11 +561,8 @@ class ChdtpAdapter(PublicAdapter):
                 result.append(NoticeSummary(key, label.strip(), absolute, date, "招标公告"))
                 if len(result) >= max_notices:
                     return result
-            if not progress or not next_url:
+            if not recognized or not progress:
                 break
-            if urlparse(next_url).hostname != "www.chdtp.com":
-                raise AdapterError("中国华电下一页链接不属于官方平台")
-            url = next_url
         if not result and not seen:
             raise AdapterError("中国华电招标公告列表未返回可识别数据，可能需要重新人工验证或页面结构已变化")
         return result
@@ -546,7 +570,7 @@ class ChdtpAdapter(PublicAdapter):
     def fetch_notice(self, url, external_id=None, detail_id=None):
         if (urlparse(url).hostname or "").lower() != "www.chdtp.com":
             raise AdapterError("请输入中国华电官方招标公告详情链接")
-        raw = self._page(url).text
+        raw = self._page(url)
         parser = PageParser()
         parser.feed(raw)
         text = clean_text(parser.text_parts)

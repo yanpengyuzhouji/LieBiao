@@ -35,6 +35,38 @@ class PublicPlatformTests(unittest.TestCase):
         self.assertEqual(pages, ['1', '2'])
         self.assertEqual(rows[0].published_at, '2026-09-08')
 
+    @patch('backend.manual_verification.browser_request')
+    def test_yfb_verified_enterprise_uses_browser_and_new_search_api(self, browser_request):
+        browser_request.return_value = {'code': 200, 'data': {'resultList': [
+            {
+                'contentId': 629767947, 'title': '建设项目招标计划',
+                'type': '招标计划', 'updateTime': '2026-09-10 10:47:59',
+            },
+            {
+                'contentId': 629767931, 'areaId': '137',
+                'title': '高效永磁同步电机招标公告',
+                'type': '招标公告', 'updateTime': '2026-09-10 10:47:57',
+            },
+        ]}}
+        with patch('backend.adapters.detect_outbound_proxy', return_value=None):
+            adapter = YfbAdapter(
+                'https://www.yfbzb.com/search/?keywords=设备',
+                session_cookie='__scout_browser_session=47; __scout_browser_port=62430',
+            )
+        adapter.client.close()
+        adapter.client = httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, request=request, text='<html>登录</html>')
+        ))
+        self.addCleanup(adapter.close)
+
+        rows = adapter.list_notices(1, 1)
+
+        requested_url = browser_request.call_args.args[1]
+        self.assertIn('qiye.qianlima.com/new_qd_yfbsite/api/search?', requested_url)
+        self.assertIn('pageSize=30', requested_url)
+        self.assertEqual(browser_request.call_args.kwargs['storage_query'], {'openid': 'YFB-OpenId'})
+        self.assertEqual(rows[0].url, 'https://www.yfbzb.com/inviteBid/detail/20260910_629767931.html')
+
     def test_yfb_ignores_sidebar_and_keeps_hidden_warning(self):
         adapter = self.adapter(YfbAdapter, lambda _: httpx.Response(200, text='<h1>设备招标公告</h1><div class="content">公开正文<br/>***<a href="/a.pdf">技术文件.pdf</a></div><aside>储能广告</aside>'))
         data = adapter.fetch_notice('https://www.yfbzb.com/inviteBid/detail/20260908_123.html')
@@ -222,6 +254,25 @@ class ChnenergyTests(unittest.TestCase):
 
 class ChdtpTests(unittest.TestCase):
     adapter = PublicPlatformTests.adapter
+
+    def test_verified_session_uses_browser_and_current_tender_page(self):
+        blocked = "<script src='/45i5xfip730ih5uh/sgodapt2y.js'></script>"
+        adapter = self.adapter(ChdtpAdapter, lambda _: httpx.Response(412, text=blocked))
+        adapter.browser_site_id = 55
+        adapter.browser_port = 43210
+        list_html = '''<a href="javascript:toGetContent('zhaobiaogg/2026/09/10/zhaobiaogg_3914671_39484.html')"
+            title="新能源设备招标公告">新能源设备招标...</a><span>[2026-09-10]</span>'''
+        detail_html = '<html><h1>新能源设备招标公告</h1><p>发布时间：2026-09-10</p></html>'
+        with patch('backend.manual_verification.browser_request', side_effect=[list_html, detail_html]) as request:
+            rows = adapter.list_notices(1, 1)
+            data = adapter.fetch_notice(rows[0].url, rows[0].external_id)
+        self.assertEqual(data.title, '新能源设备招标公告')
+        self.assertEqual(
+            request.call_args_list[0].args[:2],
+            (55, 'https://www.chdtp.com/webs/queryWebZbgg.action?zbggType=1'),
+        )
+        self.assertEqual(request.call_args_list[0].kwargs['port'], 43210)
+        self.assertFalse(request.call_args_list[0].kwargs['parse_json'])
 
     def test_security_challenge_is_never_parsed_as_notice(self):
         blocked = "<script src='/45i5xfip730ih5uh/sgodapt2y.js'></script><script l='d'>challenge</script>"

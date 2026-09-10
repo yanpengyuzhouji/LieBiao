@@ -655,11 +655,21 @@ class CdtAdapter(BaseAdapter):
         for page in range(1, max_pages + 1):
             data = {"page": page, "limit": page_size, "messagetype": "0", "startDate": "", "endDate": ""}
             try:
-                response = self.client.post(self.list_api, data=data, headers={"Referer": self.base_url})
-                response.raise_for_status()
-                if response.text.lstrip().startswith("<"):
-                    raise AdapterError("大唐集团列表触发平台安全验证，未将验证页作为公告入库")
-                payload = response.json()
+                if getattr(self, "browser_site_id", None):
+                    from .manual_verification import ManualVerificationError, browser_request
+                    try:
+                        payload = browser_request(
+                            self.browser_site_id, self.list_api, "POST", data,
+                            port=self.browser_port, form_encoded=True,
+                        )
+                    except ManualVerificationError as exc:
+                        raise AdapterError(str(exc)) from exc
+                else:
+                    response = self.client.post(self.list_api, data=data, headers={"Referer": self.base_url})
+                    response.raise_for_status()
+                    if response.text.lstrip().startswith("<"):
+                        raise AdapterError("大唐集团列表触发平台安全验证，未将验证页作为公告入库")
+                    payload = response.json()
             except AdapterError:
                 raise
             except (httpx.HTTPError, ValueError) as exc:
@@ -702,11 +712,20 @@ class CdtAdapter(BaseAdapter):
     def fetch_notice(self, url: str, external_id: str | None = None, detail_id: str | None = None) -> NoticeData:
         del detail_id
         try:
-            response = self.client.get(url)
-            response.raise_for_status()
+            if getattr(self, "browser_site_id", None):
+                from .manual_verification import ManualVerificationError, browser_request
+                try:
+                    raw_html = browser_request(
+                        self.browser_site_id, url, port=self.browser_port, parse_json=False,
+                    )
+                except ManualVerificationError as exc:
+                    raise AdapterError(str(exc)) from exc
+            else:
+                response = self.client.get(url)
+                response.raise_for_status()
+                raw_html = response.text
         except httpx.HTTPError as exc:
             raise AdapterError(f"大唐集团公告详情访问失败：{exc}") from exc
-        raw_html = response.text
         lowered = raw_html.lower()
         if "aliyunwaf" in lowered or re.search(r"\barg1\s*=", raw_html):
             raise AdapterError("大唐集团详情页触发平台安全验证，请重新完成人工验证")

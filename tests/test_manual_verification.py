@@ -108,6 +108,8 @@ class ManualVerificationTests(unittest.TestCase):
                         self.assertEqual(opener.call_args.args[1], 'https://ec.chng.com.cn/channel/home/#/purchase?top=0')
                     if site['code'] == 'yfb':
                         self.assertEqual(opener.call_args.args[1], 'https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/search')
+                    if site['code'] == 'chdtp':
+                        self.assertEqual(opener.call_args.args[1], 'https://www.chdtp.com/pages/wzglS/cgxx/caigou.jsp?cgtype=4')
 
     def test_failed_collection_check_keeps_verification_window_open(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(settings, 'data_dir', Path(folder)):
@@ -120,6 +122,55 @@ class ManualVerificationTests(unittest.TestCase):
                 response = TestClient(app).post(f'/api/sites/{site_id}/manual-verification/complete')
                 self.assertEqual(response.status_code, 400)
                 closer.assert_not_called()
+
+    def test_cdt_success_keeps_browser_for_scheduled_collection(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(settings, 'data_dir', Path(folder)):
+            init_db()
+            with get_db() as connection:
+                site_id = connection.execute("SELECT id FROM sites WHERE code='cdt'").fetchone()[0]
+            adapter = unittest.mock.Mock()
+            adapter.health_check.return_value = {'ok': True, 'message': '公开公告列表正常'}
+            credential = 'session=test; __scout_browser_port=43210'
+            with patch('backend.main.complete_verification', return_value=credential), \
+                    patch('backend.main.make_adapter', return_value=adapter) as factory, \
+                    patch('backend.main.close_verification') as closer:
+                response = TestClient(app).post(f'/api/sites/{site_id}/manual-verification/complete')
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn('__scout_browser_session=', factory.call_args.kwargs['session_cookie'])
+            closer.assert_not_called()
+
+    def test_yfb_success_keeps_browser_for_scheduled_collection(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(settings, 'data_dir', Path(folder)):
+            init_db()
+            with get_db() as connection:
+                site_id = connection.execute("SELECT id FROM sites WHERE code='yfb'").fetchone()[0]
+            adapter = unittest.mock.Mock()
+            adapter.health_check.return_value = {'ok': True, 'message': '企业公告列表正常'}
+            credential = 'Admin-Token=test; __scout_browser_port=43210'
+            with patch('backend.main.complete_verification', return_value=credential), \
+                    patch('backend.main.make_adapter', return_value=adapter), \
+                    patch('backend.main.close_verification') as closer:
+                response = TestClient(app).post(f'/api/sites/{site_id}/manual-verification/complete')
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn('请保持窗口打开', response.json()['message'])
+            closer.assert_not_called()
+
+    def test_chdtp_success_keeps_browser_for_scheduled_collection(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(settings, 'data_dir', Path(folder)):
+            init_db()
+            with get_db() as connection:
+                site_id = connection.execute("SELECT id FROM sites WHERE code='chdtp'").fetchone()[0]
+            adapter = unittest.mock.Mock()
+            adapter.health_check.return_value = {'ok': True, 'message': '人工验证有效，招标公告列表正常'}
+            credential = 'session=test; __scout_browser_port=43210'
+            with patch('backend.main.complete_verification', return_value=credential), \
+                    patch('backend.main.make_adapter', return_value=adapter) as factory, \
+                    patch('backend.main.close_verification') as closer:
+                response = TestClient(app).post(f'/api/sites/{site_id}/manual-verification/complete')
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn('__scout_browser_session=', factory.call_args.kwargs['session_cookie'])
+            self.assertIn('请保持窗口打开', response.json()['message'])
+            closer.assert_not_called()
 
     def test_cookie_header_only_keeps_target_platform(self) -> None:
         cookies = [

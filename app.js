@@ -644,6 +644,8 @@ function openConfig(kind, existing = null) {
   appState.config = { kind, existing };
   const fields = $('#config-fields');
   const title = $('#config-title');
+  const submit = $('#config-form [type="submit"]');
+  if (submit) submit.textContent = kind === 'run-all' ? '开始全部采集' : kind === 'run' ? '开始采集' : '保存';
   if (kind === 'keyword') {
     const item = existing || {};
     title.textContent = existing ? '编辑关键词组' : '新建关键词组';
@@ -654,10 +656,14 @@ function openConfig(kind, existing = null) {
     const sites = appState.sites.map(site => `<option value="${site.id}" ${String(item.site_id || (appState.sites[0] && appState.sites[0].id)) === String(site.id) ? 'selected' : ''}>${esc(site.name)}</option>`).join('');
     const groups = `<option value="">全部启用规则</option>` + appState.keywordGroups.map(group => `<option value="${group.id}" ${String(item.keyword_group_id || '') === String(group.id) ? 'selected' : ''}>${esc(group.name)}</option>`).join('');
     fields.innerHTML = `${inputField('name','任务名称',item.name || '')}<label class="form-field">采集平台<select name="site_id">${sites}</select></label><label class="form-field">关键词组<select name="keyword_group_id">${groups}</select></label>${inputField('schedule_text','执行计划（每30分钟/每天08:30/工作日08:30/手动）',item.schedule_text || '每 30 分钟', 'text', true)}${inputField('categories','公告类型（逗号分隔）',(item.categories || ['招标公告']).join(', '),'text',true)}${inputField('lookback_days','回溯天数（按北京时间自然日）',item.lookback_days != null ? item.lookback_days : 1,'number',false,'min="0" max="3650"')}${inputField('max_pages','最大页数',item.max_pages || 5,'number',false,'min="1" max="100"')}${inputField('max_notices','最大公告数',item.max_notices || 100,'number',false,'min="1" max="10000"')}${inputField('interval_ms','请求间隔（毫秒）',item.interval_ms || 1500,'number',false,'min="200" max="60000"')}${inputField('retry_max_attempts','最多尝试次数',(item.retry && item.retry.max_attempts) || 3,'number',false,'min="1" max="10"')}<label class="form-field check-field"><input name="download_attachments" type="checkbox" ${existing && !item.download_attachments ? '' : 'checked'}> 下载附件</label><label class="form-field check-field"><input name="enabled" type="checkbox" ${existing && !item.enabled ? '' : 'checked'}> 启用任务</label>`;
-  } else {
+  } else if (kind === 'run') {
     title.textContent = '配置本次采集';
     const jobs = appState.jobs.filter(job => job.enabled).map(job => `<option value="${job.id}" ${String((existing && existing.id) || '') === String(job.id) ? 'selected' : ''}>${esc(job.name)}</option>`).join('');
     fields.innerHTML = `<label class="form-field wide">采集任务<select name="job_id">${jobs}</select></label>${inputField('lookback_days','本次回溯天数',existing && existing.lookback_days != null ? existing.lookback_days : 1,'number',false,'min="0" max="3650"')}${inputField('max_pages','本次最大页数',(existing && existing.max_pages) || 5,'number',false,'min="1" max="100"')}${inputField('max_notices','本次最大公告数',(existing && existing.max_notices) || 100,'number',false,'min="1" max="10000"')}<label class="form-field check-field"><input name="download_attachments" type="checkbox" ${existing && !existing.download_attachments ? '' : 'checked'}> 下载附件</label>`;
+  } else {
+    const enabledCount = appState.jobs.filter(job => job.enabled).length;
+    title.textContent = '一键采集全部任务';
+    fields.innerHTML = `<div class="input-hint wide"><span class="hint-icon">i</span>将依次启动 ${enabledCount} 个已启用任务；以下参数留空时使用各任务原配置，本次值不会保存到任务。</div>${inputField('lookback_days','临时回溯天数（可留空）','','number',false,'min="0" max="3650" placeholder="使用各任务配置"')}${inputField('max_pages','临时最大页数（可留空）','','number',false,'min="1" max="100" placeholder="使用各任务配置"')}${inputField('max_notices','临时公告数（可留空）','','number',false,'min="1" max="10000" placeholder="使用各任务配置"')}`;
   }
   $('#config-modal-backdrop').classList.add('visible');
 }
@@ -673,7 +679,7 @@ async function submitConfig(form) {
     if (!payload.name || !payload.schedule_text) throw new Error('任务名称和执行计划不能为空');
     if (!payload.categories.length) throw new Error('请至少填写一种公告类型');
     await apiFetch(existing ? `/api/crawl-jobs/${existing.id}` : '/api/crawl-jobs', { method:existing ? 'PUT':'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
-  } else {
+  } else if (config.kind === 'run') {
     const jobId = Number(data.get('job_id'));
     if (!jobId) throw new Error('没有可运行的启用任务');
     const payload = { lookback_days:Number(data.get('lookback_days')), max_pages:Number(data.get('max_pages')), max_notices:Number(data.get('max_notices')), download_attachments:data.has('download_attachments') };
@@ -682,6 +688,22 @@ async function submitConfig(form) {
     await loadManagementData(appState.view);
     showToast(`批次 #${result.run_id} 已入队，正在启动采集；已从现在重新计时`);
     void watchCrawlRun(result.run_id);
+    return;
+  } else {
+    const payload = {};
+    const limits = { lookback_days:[0,3650], max_pages:[1,100], max_notices:[1,10000] };
+    for (const [name, [minimum, maximum]] of Object.entries(limits)) {
+      const raw = String(data.get(name) || '').trim();
+      if (!raw) continue;
+      const value = Number(raw);
+      if (!Number.isInteger(value) || value < minimum || value > maximum) throw new Error(`${name === 'lookback_days' ? '回溯天数' : name === 'max_pages' ? '最大页数' : '公告数'}超出允许范围`);
+      payload[name] = value;
+    }
+    const result = await apiFetch('/api/crawl-jobs/run-all', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    closeConfig();
+    await loadManagementData(appState.view);
+    showToast(result.message);
+    (result.started || []).forEach(item => void watchCrawlRun(item.run_id));
     return;
   }
   closeConfig(); await loadManagementData(appState.view); if (config.kind === 'keyword') await loadBackendNotices(false); showToast('配置已保存');
@@ -817,7 +839,7 @@ document.addEventListener('click', event => {
   if (toggle) { toggle.classList.toggle('on'); const row = toggle.closest('.config-row'); const copy = row && row.querySelector('.config-copy'); if (copy) copy.classList.add('updated'); showToast('匹配设置已更新'); return; }
   const toastButton = event.target.closest('[data-toast]');
   if (toastButton) { showToast(toastButton.dataset.toast); return; }
-  if (event.target.closest('#refresh-button')) { if (!backendOnline) return showToast('请先启动后端'); if (!appState.jobs.some(job => job.enabled)) return showToast('请先启用或创建采集任务'); openConfig('run', appState.jobs.find(job => job.enabled)); return; }
+  if (event.target.closest('#refresh-button')) { if (!backendOnline) return showToast('请先启动后端'); if (!appState.jobs.some(job => job.enabled)) return showToast('请先启用或创建采集任务'); openConfig('run-all'); return; }
   if (event.target === $('#overlay')) closeDetail();
 });
 

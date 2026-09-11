@@ -91,6 +91,37 @@ class ManualVerificationTests(unittest.TestCase):
         self.assertIn('__scout_browser_port=43210', credential)
         self.assertEqual(connector.call_args.args[0], 'ws://reconnected')
 
+    def test_verification_survives_dead_launcher_handle(self):
+        """msedge.exe is often only a launcher: it spawns the real browser process and
+        exits, so the Popen handle goes stale while the window stays usable. A dead
+        handle must not be reported as "no verification window running"."""
+        from backend.manual_verification import BrowserSession, complete_verification
+        launcher = unittest.mock.Mock()
+        launcher.poll.return_value = 0          # launcher already exited
+        session = BrowserSession(43210, launcher, 'ec.chng.com.cn')
+        ws = unittest.mock.MagicMock()
+        ws.__enter__.return_value = ws
+        ws.recv.side_effect = [json.dumps(item) for item in (
+            {'id': 1, 'result': {'cookies': [
+                {'domain': '.chng.com.cn', 'name': 'session', 'value': 'test'},
+            ]}},
+            {'id': 2, 'result': {'result': {'value': 'Mozilla/5.0 Test'}}},
+            {'id': 3, 'result': {'result': {'value': '{"title":"华能电子商务平台"}'}}},
+        )]
+        targets = [{
+            'type': 'page',
+            'url': 'https://ec.chng.com.cn/channel/home/#/purchase?top=0',
+            'webSocketDebuggerUrl': 'ws://reattached',
+        }]
+        with patch('backend.manual_verification._sessions', {1: session}), \
+                patch('backend.manual_verification.httpx.get') as getter, \
+                patch('backend.manual_verification.connect', return_value=ws) as connector:
+            getter.return_value.json.return_value = targets
+            credential = complete_verification(1)
+        self.assertIn('session=test', credential)
+        self.assertIn('__scout_browser_port=43210', credential)
+        self.assertEqual(connector.call_args.args[0], 'ws://reattached')
+
     def test_open_verification_routes_all_platforms_without_server_error(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(settings, 'data_dir', Path(folder)):
             init_db()

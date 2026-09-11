@@ -34,7 +34,7 @@ from .update_checker import update_monitor
 from .manual_verification import ManualVerificationError, browser_session_port, close_verification, complete_verification, open_verification
 
 
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 app = FastAPI(title="猎标 V1 API", version=APP_VERSION, docs_url="/api/docs", redoc_url=None)
 PARSE_ISSUE_SQL = """(n.ingest_status='failed' OR EXISTS (
     SELECT 1 FROM attachments ia WHERE ia.notice_id=n.id

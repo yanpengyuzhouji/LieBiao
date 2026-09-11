@@ -79,6 +79,28 @@ def _attach_session(site_id: int, port: int, expected_host: str | None = None) -
     return session
 
 
+def _live_session(site_id: int, port: int | None = None, expected_host: str | None = None,
+                  closed_message: str = "专用采集窗口已关闭，请在“平台与账号”重新打开后采集") -> BrowserSession:
+    """Return a usable session, treating the debug port rather than the Popen handle as truth.
+
+    On Windows ``msedge.exe`` is frequently only a launcher: it spawns the real browser
+    process and exits immediately, so the handle we keep goes stale while the window and
+    its debug port stay perfectly usable. Judging liveness by that handle rejects a live
+    window, so fall back to reattaching on the port the session was opened with.
+    """
+    with _lock:
+        session = _sessions.get(site_id)
+    if session is not None and session.process is not None and not _process_alive(session.process):
+        expected_host = expected_host or session.host
+        port = port or session.port
+        session = None
+    if session is None and port:
+        session = _attach_session(site_id, port, expected_host)
+    if session is None:
+        raise ManualVerificationError(closed_message)
+    return session
+
+
 def open_verification(site_id: int, url: str, profile_root: Path) -> dict[str, object]:
     if not sys.platform.startswith("win"):
         raise ManualVerificationError("人工验证窗口目前仅支持 Windows 桌面版")
@@ -139,13 +161,8 @@ def browser_request(site_id: int, url: str, method: str = "GET", payload: dict |
                     storage_query: dict[str, str] | None = None,
                     authorization_cookie: str | None = None) -> dict | str:
     """Run a same-origin public request inside an open verified Edge page."""
-    with _lock:
-        session = _sessions.get(site_id)
     expected_host = (urlparse(url).hostname or "").lower()
-    if not session and port:
-        session = _attach_session(site_id, port, expected_host)
-    if not session or not _process_alive(session.process) and session.process is not None:
-        raise ManualVerificationError("专用采集窗口已关闭，请在“平台与账号”重新打开后采集")
+    session = _live_session(site_id, port, expected_host)
     if expected_host != session.host:
         raise ManualVerificationError("浏览器采集请求地址与验证平台不一致")
     targets = httpx.get(f"http://127.0.0.1:{session.port}/json", timeout=3).json()
@@ -199,12 +216,7 @@ def browser_page_json(site_id: int, page_url: str, api_marker: str,
                       port: int | None = None) -> dict:
     """Navigate the verified page and return one JSON API response made by the site itself."""
     expected_host = (urlparse(page_url).hostname or "").lower()
-    with _lock:
-        session = _sessions.get(site_id)
-    if not session and port:
-        session = _attach_session(site_id, port, expected_host)
-    if not session or not _process_alive(session.process) and session.process is not None:
-        raise ManualVerificationError("专用采集窗口已关闭，请在“平台与账号”重新打开后采集")
+    session = _live_session(site_id, port, expected_host)
     if expected_host != session.host:
         raise ManualVerificationError("浏览器采集请求地址与验证平台不一致")
     targets = httpx.get(f"http://127.0.0.1:{session.port}/json", timeout=3).json()
@@ -250,12 +262,9 @@ def browser_page_json(site_id: int, page_url: str, api_marker: str,
 
 
 def complete_verification(site_id: int, port: int | None = None) -> str:
-    with _lock:
-        session = _sessions.get(site_id)
-    if not session and port:
-        session = _attach_session(site_id, port)
-    if not session or not _process_alive(session.process) and session.process is not None:
-        raise ManualVerificationError("没有正在运行的验证窗口，请先点击“打开人工验证”")
+    session = _live_session(
+        site_id, port, closed_message="没有正在运行的验证窗口，请先点击“打开人工验证”"
+    )
     try:
         targets = httpx.get(f"http://127.0.0.1:{session.port}/json", timeout=3).json()
         target = next((item for item in targets if item.get("type") == "page"

@@ -1,4 +1,4 @@
-#define AppVersion "1.2.5"
+#define AppVersion "2.0.0"
 [Setup]
 AppId={{B7DF54C2-A232-4BF0-82E4-42BDCAD2973F}
 AppName=猎标招标公告采集系统

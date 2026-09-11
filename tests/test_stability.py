@@ -189,19 +189,26 @@ class StabilityIntegrationTests(unittest.TestCase):
     def test_retired_platforms_are_hidden_and_their_jobs_disabled(self) -> None:
         with get_db() as connection:
             timestamp = now_iso()
-            site_id = connection.execute(
-                "INSERT INTO sites(code,name,base_url,adapter,enabled,created_at) VALUES('ceb','中国招标投标公共服务平台','https://example.com','ceb',1,?)",
-                (timestamp,),
-            ).lastrowid
+            site_ids = {}
+            for code, name in (("ceb", "中国招标投标公共服务平台"), ("espic", "中国电力设备信息网")):
+                site_ids[code] = connection.execute(
+                    "INSERT INTO sites(code,name,base_url,adapter,enabled,created_at) VALUES(?,?,?,?,1,?)",
+                    (code, name, "https://example.com", code, timestamp),
+                ).lastrowid
             connection.execute(
                 "INSERT INTO crawl_jobs(name,site_id,schedule_text,enabled,created_at) VALUES('退役平台任务',?,'每 60 分钟',1,?)",
-                (site_id, timestamp),
+                (site_ids["ceb"], timestamp),
             )
         init_db()
         with get_db() as connection:
-            self.assertEqual(connection.execute("SELECT enabled FROM sites WHERE id=?", (site_id,)).fetchone()[0], 0)
-            self.assertEqual(connection.execute("SELECT enabled FROM crawl_jobs WHERE site_id=?", (site_id,)).fetchone()[0], 0)
-        self.assertNotIn("ceb", {site["code"] for site in TestClient(app).get("/api/sites").json()["items"]})
+            self.assertEqual(connection.execute("SELECT enabled FROM sites WHERE id=?", (site_ids["ceb"],)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT enabled FROM crawl_jobs WHERE site_id=?", (site_ids["ceb"],)).fetchone()[0], 0)
+        client = TestClient(app)
+        visible_sites = {site["code"] for site in client.get("/api/sites").json()["items"]}
+        dashboard_sites = {site["code"] for site in client.get("/api/dashboard").json()["platforms"]}
+        for code in site_ids:
+            self.assertNotIn(code, visible_sites)
+            self.assertNotIn(code, dashboard_sites)
 
     def test_generic_tender_template_is_ignored_without_running_word(self) -> None:
         path = settings.temp_dir / "template.doc"

@@ -10,6 +10,8 @@ let backendOnline = false;
 let searchTimer = null;
 let updateInfo = null;
 let updateCheckRetryTimer = null;
+let noticeFilterDomLocked = false;
+let noticeFilterRequestId = 0;
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 const activeRunWatchers = new Set();
 const activeReparseWatchers = new Set();
@@ -76,6 +78,25 @@ async function checkForUpdates() {
   } catch (_) { /* 更新检查失败不影响本地功能 */ }
 }
 
+function updateNoticeCountBadges(counts = appState.noticeCounts) {
+  const safeCounts = counts || {};
+  $$('.filter-tab[data-filter-tab]').forEach(tab => {
+    const key = tab.dataset.filterTab;
+    const number = $('.tab-number', tab);
+    if (number) number.textContent = String(Number(safeCounts[key] || 0));
+  });
+  const navCount = $('#notice-nav-count');
+  if (navCount) navCount.textContent = String(Number(safeCounts.all || 0));
+  Object.entries(safeCounts).forEach(([key, value]) => {
+    const statValue = $(`.stat-card[data-stat-key="${key}"] .stat-value`);
+    if (statValue) {
+      const suffix = $('small', statValue);
+      statValue.textContent = String(Number(value || 0));
+      if (suffix) statValue.appendChild(suffix);
+    }
+  });
+}
+
 function normalizeBackendNotice(item) {
   return {
     ...item,
@@ -91,7 +112,9 @@ function normalizeBackendNotice(item) {
   };
 }
 
-async function loadBackendNotices(resetPage = true) {
+async function loadBackendNotices(resetPage = true, preserveFilterDom = false) {
+  const filterRequestId = preserveFilterDom ? ++noticeFilterRequestId : 0;
+  if (preserveFilterDom) noticeFilterDomLocked = true;
   if (resetPage) appState.page = 1;
   const params = new URLSearchParams({
     limit: String(appState.pageSize),
@@ -116,18 +139,18 @@ async function loadBackendNotices(resetPage = true) {
     notices.splice(0, notices.length, ...(payload.items || []).map(normalizeBackendNotice));
     appState.totalNotices = Number(payload.total || 0);
     appState.noticeCounts = payload.category_counts || { all: appState.totalNotices, pending: 0, focus: 0, issues: 0, unmatched: 0, trash: 0 };
+    updateNoticeCountBadges(appState.noticeCounts);
     const pageCount = Math.max(1, Math.ceil(appState.totalNotices / appState.pageSize));
     if (appState.page > pageCount) {
       appState.page = pageCount;
-      return loadBackendNotices(false);
+      return loadBackendNotices(false, preserveFilterDom);
     }
-    const count = $('#notice-nav-count');
-    if (count) count.textContent = String(appState.totalNotices);
     const sync = $('#last-sync-text');
     if (sync) sync.textContent = `数据同步于 ${new Date().toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })}（北京时间）`;
     try {
-      renderCurrentViewWithoutInterruptingFilters(true);
-      await loadManagementData(appState.view);
+      renderCurrentViewWithoutInterruptingFilters(true, preserveFilterDom);
+      await loadManagementData(appState.view, preserveFilterDom);
+      if (preserveFilterDom && filterRequestId === noticeFilterRequestId) noticeFilterDomLocked = false;
     } catch (renderError) {
       console.error('页面渲染失败', renderError);
       showToast('页面渲染失败：' + renderError.message);
@@ -137,11 +160,11 @@ async function loadBackendNotices(resetPage = true) {
     notices.splice(0, notices.length);
     appState.totalNotices = 0;
     appState.noticeCounts = { all: 0, today_new: 0, pending: 0, focus: 0, issues: 0, unmatched: 0, trash: 0 };
-    const count = $('#notice-nav-count');
-    if (count) count.textContent = '0';
+    updateNoticeCountBadges(appState.noticeCounts);
     const sync = $('#last-sync-text');
     if (sync) sync.textContent = `后端未连接：${error.message}`;
     renderCurrentViewWithoutInterruptingFilters(true);
+    if (preserveFilterDom && filterRequestId === noticeFilterRequestId) noticeFilterDomLocked = false;
   }
 }
 
@@ -167,7 +190,7 @@ async function loadStorageSettings() {
   }
 }
 
-async function loadManagementData(view = appState.view) {
+async function loadManagementData(view = appState.view, preserveFilterDom = false) {
   if (!backendOnline) return;
   try {
     const requests = await Promise.all([
@@ -180,7 +203,7 @@ async function loadManagementData(view = appState.view) {
     appState.runs = requests[4].items || [];
     appState.dashboard = requests[5] || null;
     appState.scheduler = requests[6] || null;
-    if (appState.view === view) renderCurrentViewWithoutInterruptingFilters(false);
+    if (appState.view === view) renderCurrentViewWithoutInterruptingFilters(false, preserveFilterDom);
   } catch (error) {
     showToast(`管理数据加载失败：${error.message}`);
   }
@@ -318,14 +341,14 @@ function paginationPages(current, total) {
     .sort((a, b) => a - b);
 }
 
-function statCard(icon, label, value, suffix, foot, tone = '') {
-  return `<article class="stat-card"><div class="stat-label"><span>${label}</span><span class="stat-icon">${icon}</span></div><div class="stat-value">${value}<small class="${tone}">${suffix}</small></div><div class="stat-foot">${foot}</div></article>`;
+function statCard(icon, label, value, suffix, foot, tone = '', key = '') {
+  return `<article class="stat-card"${key ? ` data-stat-key="${key}"` : ''}><div class="stat-label"><span>${label}</span><span class="stat-icon">${icon}</span></div><div class="stat-value">${value}<small class="${tone}">${suffix}</small></div><div class="stat-foot">${foot}</div></article>`;
 }
 
 function renderStats() {
   if (backendOnline) {
-    const counts = (appState.dashboard && appState.dashboard.counts) || {};
-    return `<div class="stats-grid">${statCard('▤', '今日新增', counts.today_new || 0, '', '按今日首次入库统计')}${statCard('◌', '待确认', counts.pending || 0, '', '需要人工判断', 'trend-warn')}${statCard('★', '重点关注', counts.focus || 0, '', '业务标记统计', 'trend-up')}${statCard('!', '解析异常', counts.issues || 0, '', counts.issues ? '需处理' : '当前无异常', 'trend-danger')}</div>`;
+    const counts = appState.view === 'notices' ? (appState.noticeCounts || {}) : ((appState.dashboard && appState.dashboard.counts) || {});
+    return `<div class="stats-grid">${statCard('▤', '今日新增', counts.today_new || 0, '', '按今日首次入库统计', '', 'today_new')}${statCard('◌', '待确认', counts.pending || 0, '', '需要人工判断', 'trend-warn', 'pending')}${statCard('★', '重点关注', counts.focus || 0, '', '业务标记统计', 'trend-up', 'focus')}${statCard('!', '解析异常', counts.issues || 0, '', counts.issues ? '需处理' : '当前无异常', 'trend-danger', 'issues')}</div>`;
   }
   const pending = notices.filter(item => item.mark === 'pending').length;
   const focus = notices.filter(item => item.mark === 'focus').length;
@@ -414,7 +437,6 @@ function renderNotices() {
       <label class="select-wrap platform"><select id="platform-filter"><option value="all">全部平台</option>${appState.sites.map(site => `<option value="${esc(site.code)}" ${appState.platform === site.code ? 'selected' : ''}>${esc(site.name)}</option>`).join('')}</select></label>
       <label class="select-wrap"><select id="mark-filter"><option value="all">业务标记</option><option value="pending" ${appState.mark === 'pending' ? 'selected' : ''}>待确认</option><option value="relevant" ${appState.mark === 'relevant' ? 'selected' : ''}>相关</option><option value="focus" ${appState.mark === 'focus' ? 'selected' : ''}>重点关注</option><option value="processed" ${appState.mark === 'processed' ? 'selected' : ''}>已处理</option></select></label>
       <label class="select-wrap"><select id="attachment-filter"><option value="all">附件情况</option><option value="yes" ${appState.attachment === 'yes' ? 'selected' : ''}>有附件</option><option value="no" ${appState.attachment === 'no' ? 'selected' : ''}>无附件</option></select></label>
-      <button class="filter-more"><span>＋</span>更多筛选</button>
     </div>
     ${appState.tab === 'trash' ? '<div class="trash-actions"><span>永久删除会清理公告、附件、解析结果和文件哈希，仅保留防止再次采集的最小排除标记。</span><button class="batch-action" data-empty-trash>清空回收站</button></div>' : ''}
     <div class="batch-bar ${appState.selected.size ? 'visible' : ''}" id="batch-bar"><span>已选择 <strong id="selected-count">${appState.selected.size}</strong> 条</span><div class="batch-actions">${appState.tab === 'trash' ? '<button class="batch-action" data-batch-restore>批量恢复</button><button class="batch-action danger" data-batch-permanent-delete>永久删除</button>' : '<button class="batch-action" data-batch-mark="relevant">标记为相关</button><button class="batch-action" data-batch-mark="focus">设为重点</button><button class="batch-action danger" data-batch-delete>批量删除</button>'}</div></div>
@@ -542,7 +564,11 @@ function renderCurrentView() {
   const viewRenderers = { overview: backendOnline ? renderOverviewLive : renderOverview, notices: renderNotices, keywords: renderKeywords, jobs: renderJobs, platforms: renderPlatforms, imports: renderImports, logs: renderLogs };
   container.innerHTML = viewRenderers[appState.view]();
   if (appState.view === 'notices') renderNoticeTable();
-  if (appState.view === 'imports') loadStorageSettings();
+  if (appState.view === 'imports') {
+    loadStorageSettings();
+    const importHistory = $$('.panel-card', container).find(panel => $('h3', panel)?.textContent.trim() === '最近导入');
+    if (importHistory) importHistory.remove();
+  }
 }
 
 function noticeFilterIsActive() {
@@ -552,10 +578,10 @@ function noticeFilterIsActive() {
     && active.matches('#notice-search, #platform-filter, #mark-filter, #attachment-filter');
 }
 
-function renderCurrentViewWithoutInterruptingFilters(refreshNoticeTable = false) {
+function renderCurrentViewWithoutInterruptingFilters(refreshNoticeTable = false, preserveFilterDom = false) {
   // Crawl status is polled every few seconds. Replacing #view-container while a
   // native select is open disconnects the element and makes the dropdown close.
-  if (noticeFilterIsActive()) {
+  if (preserveFilterDom || noticeFilterDomLocked || noticeFilterIsActive()) {
     if (refreshNoticeTable) renderNoticeTable();
     return;
   }
@@ -751,7 +777,7 @@ document.addEventListener('click', event => {
   const detail = event.target.closest('[data-open-detail]');
   if (detail) { openDetail(detail.dataset.openDetail); return; }
   const filterTab = event.target.closest('[data-filter-tab]');
-  if (filterTab) { appState.tab = filterTab.dataset.filterTab; appState.page = 1; $$('.filter-tab[data-filter-tab]').forEach(tab => tab.classList.toggle('active', tab === filterTab)); loadBackendNotices(false); return; }
+  if (filterTab) { appState.tab = filterTab.dataset.filterTab; appState.mark = 'all'; appState.page = 1; $$('.filter-tab[data-filter-tab]').forEach(tab => tab.classList.toggle('active', tab === filterTab)); loadBackendNotices(false); return; }
   const pageButton = event.target.closest('[data-page]');
   if (pageButton && !pageButton.disabled) { appState.page = Number(pageButton.dataset.page); loadBackendNotices(false); return; }
   const reset = event.target.closest('[data-reset-filters]');
@@ -854,13 +880,13 @@ document.addEventListener('input', event => {
     appState.query = event.target.value;
     appState.page = 1;
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => loadBackendNotices(false), 300);
+    searchTimer = setTimeout(() => loadBackendNotices(false, true), 300);
   }
 });
 document.addEventListener('change', event => {
-  if (event.target.id === 'platform-filter') { appState.platform = event.target.value; appState.page = 1; loadBackendNotices(false); }
-  if (event.target.id === 'mark-filter') { appState.mark = event.target.value; appState.page = 1; loadBackendNotices(false); }
-  if (event.target.id === 'attachment-filter') { appState.attachment = event.target.value; appState.page = 1; loadBackendNotices(false); }
+  if (event.target.id === 'platform-filter') { appState.platform = event.target.value; appState.page = 1; loadBackendNotices(false, true); }
+  if (event.target.id === 'mark-filter') { appState.mark = event.target.value; if (appState.mark !== 'all') appState.tab = 'all'; $$('.filter-tab[data-filter-tab]').forEach(tab => tab.classList.toggle('active', tab.dataset.filterTab === appState.tab)); appState.page = 1; loadBackendNotices(false, true); }
+  if (event.target.id === 'attachment-filter') { appState.attachment = event.target.value; appState.page = 1; loadBackendNotices(false, true); }
   if (event.target.id === 'excel-file') uploadSelectedFile(event.target, '/api/imports/excel');
   if (event.target.id === 'attachment-file') uploadSelectedFile(event.target, '/api/imports/file');
 });

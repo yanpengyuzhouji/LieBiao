@@ -186,6 +186,40 @@ class StabilityIntegrationTests(unittest.TestCase):
         self.assertIn(str(today_id), {item["id"] for item in result["items"]})
         self.assertNotIn(str(old_id), {item["id"] for item in result["items"]})
 
+    def test_notice_category_counts_follow_platform_mark_and_attachment_filters(self) -> None:
+        with get_db() as connection:
+            sites = connection.execute(
+                "SELECT id,code FROM sites WHERE code NOT IN ('ceb','espic') ORDER BY id LIMIT 2"
+            ).fetchall()
+            self.assertEqual(len(sites), 2)
+            first, second = sites
+            focus_id = ingest_notice_data(
+                connection, first["id"], NoticeData("facet-focus", "筛选统计重点公告", "https://example.com/facet-focus", "正文"),
+                source_type="file_import", download_attachments=False,
+            )
+            pending_id = ingest_notice_data(
+                connection, first["id"], NoticeData("facet-pending", "筛选统计待确认公告", "https://example.com/facet-pending", "正文"),
+                source_type="file_import", download_attachments=False,
+            )
+            other_id = ingest_notice_data(
+                connection, second["id"], NoticeData("facet-other", "筛选统计其他平台公告", "https://example.com/facet-other", "正文"),
+                source_type="file_import", download_attachments=False,
+            )
+            connection.execute("UPDATE notices SET business_mark='focus' WHERE id=?", (focus_id,))
+            create_attachment(connection, focus_id, "筛选统计附件.pdf", None)
+            connection.commit()
+
+        filtered = list_notices(platform=first["code"], mark="focus", attachment="yes", limit=100, offset=0)
+        self.assertEqual(filtered["total"], 1)
+        self.assertEqual(filtered["category_counts"]["all"], 1)
+        self.assertEqual(filtered["category_counts"]["focus"], 1)
+        self.assertEqual(filtered["category_counts"]["pending"], 0)
+
+        no_attachment = list_notices(platform=first["code"], attachment="no", limit=100, offset=0)
+        self.assertEqual(no_attachment["category_counts"]["all"], 1)
+        self.assertEqual(no_attachment["category_counts"]["pending"], 1)
+        self.assertNotIn(str(other_id), {item["id"] for item in no_attachment["items"]})
+
     def test_retired_platforms_are_hidden_and_their_jobs_disabled(self) -> None:
         with get_db() as connection:
             timestamp = now_iso()

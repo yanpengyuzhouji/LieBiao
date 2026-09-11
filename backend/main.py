@@ -865,6 +865,8 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
         clauses.append("EXISTS (SELECT 1 FROM attachments af WHERE af.notice_id=n.id)")
     elif attachment == "no":
         clauses.append("NOT EXISTS (SELECT 1 FROM attachments af WHERE af.notice_id=n.id)")
+    if mark != "all":
+        clauses.append("n.business_mark=?"); params.append(mark)
     base_clauses = list(clauses)
     base_params = list(params)
     if only_deleted:
@@ -881,8 +883,6 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
     # while the separate possible-missed-match recovery view is selected.
     facet_clauses = scope_clauses + ["(n.source_type<>'crawl' OR EXISTS (SELECT 1 FROM keyword_hits fh WHERE fh.notice_id=n.id AND fh.is_negative=0))"]
     facet_params = scope_params
-    if mark != "all":
-        clauses.append("n.business_mark=?"); params.append(mark)
     if status != "all":
         clauses.append("n.ingest_status=?"); params.append(status)
     if only_issues:

@@ -31,7 +31,7 @@ from . import reparse_tasks
 from .maintenance import activity
 from .migration import adopt_storage, migrate_storage
 from .update_checker import update_monitor
-from .manual_verification import ManualVerificationError, browser_session_port, close_verification, complete_verification, open_verification
+from .manual_verification import ManualVerificationError, background_persistent_session, browser_session_port, close_verification, complete_verification, ensure_persistent_session, open_verification, replace_browser_session_port
 
 
 APP_VERSION = "1.2.4"
@@ -319,11 +319,25 @@ def site_health_check(site_id: int) -> dict[str, Any]:
         account = select_site_account(connection, site_id)
     if not site:
         raise HTTPException(status_code=404, detail="平台不存在")
-    adapter = make_adapter(site["code"], site["base_url"], session_cookie=account["credential_ref"] if account else None)
+    credential = account["credential_ref"] if account else None
+    adapter = None
     try:
+        browser_port = browser_session_port(credential)
+        if account and account["session_status"] == "verified" and browser_port:
+            session = ensure_persistent_session(
+                site_id, site["base_url"], settings.data_dir / "browser_sessions", browser_port,
+            )
+            if session.port != browser_port:
+                credential = replace_browser_session_port(credential, session.port)
+                with get_db() as connection:
+                    connection.execute("UPDATE site_accounts SET credential_ref=? WHERE id=?", (credential, account["id"]))
+        adapter = make_adapter(site["code"], site["base_url"], session_cookie=credential)
         result = adapter.health_check()
+    except ManualVerificationError as exc:
+        result = {"ok": False, "status_code": 504, "message": str(exc)}
     finally:
-        adapter.close()
+        if adapter is not None:
+            adapter.close()
     with get_db() as connection:
         connection.execute("UPDATE sites SET health_status=?,health_message=?,last_checked_at=? WHERE id=?", ("healthy" if result["ok"] else "unhealthy", result["message"], now_iso(), site_id))
         log_event(connection, "site.health", f"{site['name']}：{result['message']}", "INFO" if result["ok"] else "WARNING")
@@ -501,10 +515,27 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
                 (result.get("message") or "人工验证成功", timestamp, site_id),
             )
             log_event(connection, "site.manual_verify", f"{site['name']}：人工验证成功，会话已绑定采集任务")
+        if keep_browser:
+            try:
+                background = background_persistent_session(site_id)
+            except ManualVerificationError as exc:
+                background = None
+                log_message = f"人工验证成功，但后台浏览器切换失败：{exc}"
+                with get_db() as connection:
+                    log_event(connection, "site.manual_verify", f"{site['name']}：{log_message}", "WARNING")
+            if background:
+                new_cookie = replace_browser_session_port(cookie, background.port)
+                if new_cookie != cookie:
+                    cookie = new_cookie
+                    with get_db() as connection:
+                        connection.execute(
+                            "UPDATE site_accounts SET credential_ref=? WHERE site_id=? AND alias='人工验证会话'",
+                            (cookie, site_id),
+                        )
         completed = True
         message = "人工验证成功，已绑定该平台采集任务，可立即采集"
         if keep_browser:
-            message += "；该平台定时采集依赖专用窗口，请保持窗口打开"
+            message += "；专用浏览器已转入后台持久运行，定时采集会自动唤醒"
         return {"ok": True, "mode": result.get("mode"), "message": message}
     except ManualVerificationError as exc:
         with get_db() as connection:

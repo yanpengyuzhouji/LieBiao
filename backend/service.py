@@ -19,6 +19,7 @@ from .config import settings
 from .db import beijing_time, get_db, json_load, log_event, now_iso, select_site_account
 from .matching import match_sources
 from .maintenance import tracked
+from .manual_verification import browser_session_port, ensure_persistent_session, replace_browser_session_port
 from .parsers import archive_type, file_mime, is_office_lock_file, parse_document, safe_extract_zip, sha256_file
 from .storage import absolute_from_relative, attachment_directory, extraction_directory, relative_to_data, safe_name, save_raw_html
 
@@ -739,6 +740,20 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
             log_event(connection, "crawl.policy_filter", f"{title}：{rejection}", "INFO", crawl_run_id=run_id)
 
     try:
+        if job["session_status"] == "verified":
+            browser_port = browser_session_port(job["credential_ref"])
+            if browser_port:
+                session = ensure_persistent_session(
+                    job["site_id"], job["base_url"], settings.data_dir / "browser_sessions", browser_port,
+                )
+                if session.port != browser_port:
+                    job["credential_ref"] = replace_browser_session_port(job["credential_ref"], session.port)
+                    if job.get("account_id"):
+                        with get_db() as connection:
+                            connection.execute(
+                                "UPDATE site_accounts SET credential_ref=? WHERE id=?",
+                                (job["credential_ref"], job["account_id"]),
+                            )
         adapter = make_adapter(job["code"], job["base_url"], session_cookie=job["credential_ref"] if job["session_status"] == "verified" else None)
         if hasattr(adapter, "set_request_interval"):
             adapter.set_request_interval(job["interval_ms"])

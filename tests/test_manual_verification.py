@@ -15,6 +15,71 @@ from fastapi.testclient import TestClient
 
 
 class ManualVerificationTests(unittest.TestCase):
+    def test_browser_request_timeout_is_reported_as_recoverable_error(self):
+        from backend.manual_verification import BrowserSession, ManualVerificationError, browser_request
+        session = BrowserSession(43210, None, "ec.chng.com.cn")
+        ws = unittest.mock.MagicMock()
+        ws.__enter__.return_value = ws
+        ws.recv.side_effect = TimeoutError()
+        targets = [{
+            "type": "page",
+            "url": "https://ec.chng.com.cn/channel/home/#/purchase?top=0",
+            "webSocketDebuggerUrl": "ws://timeout",
+        }]
+        with patch("backend.manual_verification._sessions", {1: session}), \
+                patch("backend.manual_verification.httpx.get") as getter, \
+                patch("backend.manual_verification.connect", return_value=ws):
+            getter.return_value.json.return_value = targets
+            with self.assertRaises(ManualVerificationError) as raised:
+                browser_request(1, "https://ec.chng.com.cn/scm-uiaoauth-web/s/business/uiaouth/query")
+        self.assertIn("超时", str(raised.exception))
+
+    def test_recovery_relaunches_the_same_profile_in_background(self):
+        from backend.manual_verification import ensure_persistent_session
+        with tempfile.TemporaryDirectory() as folder, \
+                patch("backend.manual_verification._edge_path", return_value="msedge.exe"), \
+                patch("backend.manual_verification._free_port", return_value=45678), \
+                patch("backend.manual_verification._profile_is_locked", return_value=False), \
+                patch("backend.manual_verification.subprocess.Popen") as popen, \
+                patch("backend.manual_verification.httpx.get") as getter:
+            process = unittest.mock.Mock()
+            process.poll.return_value = None
+            popen.return_value = process
+            getter.return_value.status_code = 200
+            session = ensure_persistent_session(
+                88, "https://tang.cdt-ec.com/notice/moreController/toMore", Path(folder),
+            )
+        args = popen.call_args.args[0]
+        self.assertEqual(session.port, 45678)
+        self.assertIn("--start-minimized", args)
+        self.assertIn("--window-position=-32000,-32000", args)
+        self.assertIn(f"--user-data-dir={Path(folder).resolve() / '88'}", args)
+
+    def test_browser_port_replacement_preserves_other_session_fields(self):
+        from backend.manual_verification import replace_browser_session_port
+        credential = "session=test; __scout_browser_port=1234; __scout_browser_session=9"
+        self.assertEqual(
+            replace_browser_session_port(credential, 5678),
+            "session=test; __scout_browser_port=5678; __scout_browser_session=9",
+        )
+
+    def test_health_timeout_returns_structured_result_instead_of_http_500(self):
+        from backend.manual_verification import ManualVerificationError
+        with tempfile.TemporaryDirectory() as folder, patch.object(settings, 'data_dir', Path(folder)):
+            init_db()
+            with get_db() as connection:
+                site_id = connection.execute("SELECT id FROM sites WHERE code='cdt'").fetchone()[0]
+                connection.execute(
+                    "INSERT INTO site_accounts(site_id,alias,credential_ref,session_status,enabled,created_at) "
+                    "VALUES(?, '人工验证会话', '__scout_browser_session=1; __scout_browser_port=43210', 'verified', 1, '2026-09-11')",
+                    (site_id,),
+                )
+            with patch("backend.main.ensure_persistent_session", side_effect=ManualVerificationError("专用浏览器请求超时")):
+                response = TestClient(app).post(f"/api/sites/{site_id}/health-check")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertFalse(response.json()["ok"])
+            self.assertEqual(response.json()["status_code"], 504)
+
     def test_capture_uses_platform_tab_and_keeps_public_page_for_diagnosis(self):
         from backend.manual_verification import BrowserSession, complete_verification
         process = unittest.mock.Mock()
@@ -183,7 +248,7 @@ class ManualVerificationTests(unittest.TestCase):
                     patch('backend.main.close_verification') as closer:
                 response = TestClient(app).post(f'/api/sites/{site_id}/manual-verification/complete')
             self.assertEqual(response.status_code, 200, response.text)
-            self.assertIn('请保持窗口打开', response.json()['message'])
+            self.assertIn('后台持久运行', response.json()['message'])
             closer.assert_not_called()
 
     def test_yfb_browser_storage_login_does_not_require_cookie(self):
@@ -245,7 +310,7 @@ class ManualVerificationTests(unittest.TestCase):
                 response = TestClient(app).post(f'/api/sites/{site_id}/manual-verification/complete')
             self.assertEqual(response.status_code, 200, response.text)
             self.assertIn('__scout_browser_session=', factory.call_args.kwargs['session_cookie'])
-            self.assertIn('请保持窗口打开', response.json()['message'])
+            self.assertIn('后台持久运行', response.json()['message'])
             closer.assert_not_called()
 
     def test_cookie_header_only_keeps_target_platform(self) -> None:

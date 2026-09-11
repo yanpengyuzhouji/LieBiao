@@ -17,7 +17,7 @@ class NoticeFilterStabilityTests(unittest.TestCase):
     def test_frontend_cache_key_is_bumped_for_filter_fix(self):
         source = (ROOT / "index.html").read_text(encoding="utf-8")
 
-        self.assertIn("app.js?v=20260910-1", source)
+        self.assertIn("app.js?v=20260911-1", source)
 
 
 if __name__ == "__main__":

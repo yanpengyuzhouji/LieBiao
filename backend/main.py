@@ -304,7 +304,7 @@ def update_storage_settings(payload: StorageRequest) -> dict[str, Any]:
 @app.get("/api/sites")
 def list_sites() -> dict[str, Any]:
     with get_db() as connection:
-        sites = [localize(dict(row), ("last_checked_at", "created_at")) for row in connection.execute("SELECT * FROM sites ORDER BY id").fetchall()]
+        sites = [localize(dict(row), ("last_checked_at", "created_at")) for row in connection.execute("SELECT * FROM sites WHERE enabled=1 ORDER BY id").fetchall()]
         for site in sites:
             accounts = connection.execute("SELECT id,alias,username,login_mode,session_status,last_login_at,expires_at,status_reason,enabled FROM site_accounts WHERE site_id=? ORDER BY id", (site["id"],)).fetchall()
             site["accounts"] = [localize(dict(account), ("last_login_at", "expires_at", "created_at")) for account in accounts]
@@ -645,7 +645,7 @@ def delete_keyword_group(group_id: int) -> dict[str, Any]:
 @app.get("/api/crawl-jobs")
 def list_jobs() -> dict[str, Any]:
     with get_db() as connection:
-        rows = connection.execute("SELECT j.*,s.code AS site_code,s.name AS site_name,g.name AS keyword_group_name FROM crawl_jobs j JOIN sites s ON s.id=j.site_id LEFT JOIN keyword_groups g ON g.id=j.keyword_group_id ORDER BY j.id").fetchall()
+        rows = connection.execute("SELECT j.*,s.code AS site_code,s.name AS site_name,g.name AS keyword_group_name FROM crawl_jobs j JOIN sites s ON s.id=j.site_id LEFT JOIN keyword_groups g ON g.id=j.keyword_group_id WHERE s.enabled=1 ORDER BY j.id").fetchall()
     return {"items": [localize({**dict(row), "categories": json_load(row["categories_json"], []), "retry": json_load(row["retry_json"], {})}, ("last_run_at", "schedule_anchor_at", "created_at")) for row in rows]}
 
 
@@ -695,9 +695,11 @@ def update_job(job_id: int, payload: JobRequest) -> dict[str, Any]:
 @app.patch("/api/crawl-jobs/{job_id}/enabled")
 def set_job_enabled(job_id: int, payload: EnabledRequest) -> dict[str, Any]:
     with get_db() as connection:
-        row = connection.execute("SELECT name,enabled FROM crawl_jobs WHERE id=?", (job_id,)).fetchone()
+        row = connection.execute("SELECT j.name,j.enabled,s.enabled AS site_enabled FROM crawl_jobs j JOIN sites s ON s.id=j.site_id WHERE j.id=?", (job_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="采集任务不存在")
+        if payload.enabled and not row["site_enabled"]:
+            raise HTTPException(status_code=400, detail="该采集平台已停用，不能启用任务")
         anchor = now_iso() if payload.enabled and not row["enabled"] else None if not payload.enabled else connection.execute("SELECT schedule_anchor_at FROM crawl_jobs WHERE id=?", (job_id,)).fetchone()["schedule_anchor_at"]
         connection.execute("UPDATE crawl_jobs SET enabled=?,schedule_anchor_at=? WHERE id=?", (int(payload.enabled), anchor, job_id))
         log_event(connection, "job.enabled", f"任务{('启用' if payload.enabled else '停用')}：{row['name']}")

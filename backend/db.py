@@ -339,6 +339,10 @@ def init_db() -> None:
             "OR lower(name) LIKE '%投标人部分）%' OR lower(name) LIKE '%投标人部分)%'"
         )
         seed_base_data(connection)
+        # 这两个站点无法稳定完成无人值守列表+详情采集；保留站点行仅用于历史公告外键追溯。
+        connection.execute("UPDATE sites SET enabled=0 WHERE code IN ('ceb','espic')")
+        connection.execute("UPDATE site_accounts SET enabled=0 WHERE site_id IN (SELECT id FROM sites WHERE code IN ('ceb','espic'))")
+        connection.execute("UPDATE crawl_jobs SET enabled=0,schedule_anchor_at=NULL WHERE site_id IN (SELECT id FROM sites WHERE code IN ('ceb','espic'))")
 
 
 def recover_incomplete_runs() -> int:
@@ -379,10 +383,8 @@ def seed_base_data(connection: sqlite3.Connection) -> None:
         ("epec", "中国石化物资", "https://bidding.epec.com/tenderInfoOne?key=1", "epec", "public"),
         ("chng", "中国华能", "https://ec.chng.com.cn/channel/home/#/purchase?top=0", "chng", "public"),
         ("cdt", "大唐集团", "https://tang.cdt-ec.com/notice/moreController/toMore?globleType=0", "cdt", "public"),
-        ("ceb", "中国招标投标公共服务平台", "https://bulletin.cebpubservice.com/", "ceb", "restricted"),
         ("yfb", "乙方宝", "https://www.yfbzb.com/search/invitedBidSearch?defaultSearch=true", "yfb", "public_partial"),
         ("chnenergy", "国家能源（国能e招）", "https://www.chnenergybidding.com.cn/bidweb/", "chnenergy", "public"),
-        ("espic", "中国电力设备信息网", "https://ebid.espic.com.cn/newgdtcms//category/bulletinListNew.html?dates=300&categoryId=2&tenderMethod=01&tabName=%E6%8B%9B%E6%A0%87%E4%BF%A1%E6%81%AF&page=1", "espic", "restricted"),
         ("cgn", "中广核", "https://ecp.cgnpc.com.cn/Default.html", "cgn", "public"),
         ("chdtp", "中国华电集团电子商务平台", "https://www.chdtp.com/pages/wzglS/homepage/index.jsp", "chdtp", "public_or_session"),
     ]
@@ -392,8 +394,6 @@ def seed_base_data(connection: sqlite3.Connection) -> None:
             (code, name, url, adapter, public_mode, timestamp),
         )
     # Keep corrected official announcement entries when upgrading an existing DB.
-    connection.execute("UPDATE sites SET base_url='https://bulletin.cebpubservice.com/' WHERE code='ceb'")
-    connection.execute("UPDATE sites SET base_url='https://ebid.espic.com.cn/newgdtcms//category/bulletinListNew.html?dates=300&categoryId=2&tenderMethod=01&tabName=%E6%8B%9B%E6%A0%87%E4%BF%A1%E6%81%AF&page=1' WHERE code='espic'")
     keyword = connection.execute("SELECT id FROM keyword_groups WHERE name = '储能与新能源'").fetchone()
     if first_install and not keyword:
         connection.execute(

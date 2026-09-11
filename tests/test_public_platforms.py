@@ -275,7 +275,8 @@ class PublicPlatformTests(unittest.TestCase):
                 init_db()
                 init_db()
                 with get_db() as db:
-                    self.assertEqual(db.execute("SELECT COUNT(*) FROM sites WHERE code IN ('ceb','yfb','chnenergy','espic','cgn')").fetchone()[0], 5)
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM sites WHERE code IN ('yfb','chnenergy','cgn')").fetchone()[0], 3)
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM sites WHERE code IN ('ceb','espic')").fetchone()[0], 0)
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM sites WHERE code='neep'").fetchone()[0], 0)
                     self.assertEqual(find_site(db, 'https://www.chnenergybidding.com.cn/bidweb/')['code'], 'chnenergy')
                     self.assertIsNone(find_site(db, 'https://other-bucket.aliyuncs.com/1.html'))

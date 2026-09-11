@@ -186,6 +186,23 @@ class StabilityIntegrationTests(unittest.TestCase):
         self.assertIn(str(today_id), {item["id"] for item in result["items"]})
         self.assertNotIn(str(old_id), {item["id"] for item in result["items"]})
 
+    def test_retired_platforms_are_hidden_and_their_jobs_disabled(self) -> None:
+        with get_db() as connection:
+            timestamp = now_iso()
+            site_id = connection.execute(
+                "INSERT INTO sites(code,name,base_url,adapter,enabled,created_at) VALUES('ceb','中国招标投标公共服务平台','https://example.com','ceb',1,?)",
+                (timestamp,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO crawl_jobs(name,site_id,schedule_text,enabled,created_at) VALUES('退役平台任务',?,'每 60 分钟',1,?)",
+                (site_id, timestamp),
+            )
+        init_db()
+        with get_db() as connection:
+            self.assertEqual(connection.execute("SELECT enabled FROM sites WHERE id=?", (site_id,)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT enabled FROM crawl_jobs WHERE site_id=?", (site_id,)).fetchone()[0], 0)
+        self.assertNotIn("ceb", {site["code"] for site in TestClient(app).get("/api/sites").json()["items"]})
+
     def test_generic_tender_template_is_ignored_without_running_word(self) -> None:
         path = settings.temp_dir / "template.doc"
         path.parent.mkdir(parents=True, exist_ok=True)

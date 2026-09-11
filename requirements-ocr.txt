@@ -1,0 +1,3 @@
+# Windows OCR builds must use Python 3.9-3.13; PaddlePaddle has no Python 3.14 wheel.
+paddlepaddle==3.3.0
+paddleocr==3.7.0

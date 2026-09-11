@@ -3,7 +3,7 @@ const notices = [];
 const appState = {
   view: 'notices', tab: 'all', query: '', platform: 'all', mark: 'all', attachment: 'all', selected: new Set(), detailId: null, detailTab: 'info', importTab: 'url',
   keywordGroups: [], jobs: [], sites: [], logs: [], runs: [], dashboard: null, scheduler: null, config: null, page: 1, pageSize: 10, totalNotices: 0,
-  noticeCounts: { all: 0, pending: 0, focus: 0, issues: 0, unmatched: 0, trash: 0 }
+  noticeCounts: { all: 0, today_new: 0, pending: 0, focus: 0, issues: 0, unmatched: 0, trash: 0 }
 };
 
 let backendOnline = false;
@@ -100,7 +100,8 @@ async function loadBackendNotices(resetPage = true) {
     platform: appState.platform,
     mark: appState.tab === 'pending' ? 'pending' : appState.tab === 'focus' ? 'focus' : appState.mark,
     attachment: appState.attachment,
-    only_issues: String(appState.tab === 'issues')
+    only_issues: String(appState.tab === 'issues'),
+    only_today_new: String(appState.tab === 'today_new')
   });
   if (appState.tab === 'unmatched') {
     params.set('only_matched', 'false');
@@ -135,7 +136,7 @@ async function loadBackendNotices(resetPage = true) {
     backendOnline = false;
     notices.splice(0, notices.length);
     appState.totalNotices = 0;
-    appState.noticeCounts = { all: 0, pending: 0, focus: 0, issues: 0, unmatched: 0, trash: 0 };
+    appState.noticeCounts = { all: 0, today_new: 0, pending: 0, focus: 0, issues: 0, unmatched: 0, trash: 0 };
     const count = $('#notice-nav-count');
     if (count) count.textContent = '0';
     const sync = $('#last-sync-text');
@@ -392,6 +393,7 @@ function renderNotices() {
     issues: notices.filter(item => item.status === 'failed' || item.status === 'partial').length
   };
   const total = counts.all;
+  const todayNew = counts.today_new || 0;
   const pending = counts.pending;
   const focus = counts.focus;
   const issues = counts.issues;
@@ -400,6 +402,7 @@ function renderNotices() {
   return `${renderStats()}${renderDataStrip()}<div class="toolbar-card">
     <div class="filter-tabs">
       <button class="filter-tab ${appState.tab === 'all' ? 'active' : ''}" data-filter-tab="all">全部 <span class="tab-number">${total}</span></button>
+      <button class="filter-tab ${appState.tab === 'today_new' ? 'active' : ''}" data-filter-tab="today_new">今日新增 <span class="tab-number">${todayNew}</span></button>
       <button class="filter-tab ${appState.tab === 'pending' ? 'active' : ''}" data-filter-tab="pending">待确认 <span class="tab-number">${pending}</span></button>
       <button class="filter-tab ${appState.tab === 'focus' ? 'active' : ''}" data-filter-tab="focus">重点关注 <span class="tab-number">${focus}</span></button>
       <button class="filter-tab ${appState.tab === 'issues' ? 'active' : ''}" data-filter-tab="issues">解析异常 <span class="tab-number">${issues}</span></button>
@@ -595,7 +598,8 @@ function detailFiles(notice) {
 function renderDrawer(notice) {
   const body = $('#drawer-body');
   const tabContent = appState.detailTab === 'info' ? detailInfo(notice) : appState.detailTab === 'evidence' ? detailEvidence(notice) : detailFiles(notice);
-  const actions = notice.isDeleted ? '<button class="button button-primary" data-drawer-restore>恢复到公告库</button><button class="button button-danger" data-drawer-permanent-delete>永久删除</button>' : '<button class="button button-primary" data-drawer-mark="relevant">标记为相关</button><button class="button button-secondary" data-drawer-mark="focus">重点关注</button><button class="button button-secondary" data-reparse-notice>重新解析</button><button class="button button-danger" data-drawer-delete>软删除</button>';
+  const needsOcr = notice.files.some(file => String(file.error || '').includes('OCR') || file.parseStatus === 'ocr_pending');
+  const actions = notice.isDeleted ? '<button class="button button-primary" data-drawer-restore>恢复到公告库</button><button class="button button-danger" data-drawer-permanent-delete>永久删除</button>' : `<button class="button button-primary" data-drawer-mark="relevant">标记为相关</button><button class="button button-secondary" data-drawer-mark="focus">重点关注</button><button class="button button-secondary" data-reparse-notice>重新解析</button>${needsOcr ? '<button class="button button-primary" data-ocr-notice>OCR识别</button>' : ''}<button class="button button-danger" data-drawer-delete>软删除</button>`;
   body.innerHTML = `<div class="drawer-title-block"><div class="drawer-badges"><span class="source-chip ${notice.platformClass}">${notice.platformName}</span><span class="status-tag status-${notice.status}">${notice.statusText}</span><span class="mark-tag mark-${notice.mark}">${notice.markText}</span></div><h2 class="drawer-title">${esc(notice.title)}</h2><div class="drawer-source"><span>来源链接</span><a href="${esc(notice.sourceUrl || '#')}" target="_blank" rel="noreferrer">打开原公告 ↗</a><span style="margin-left:auto;color:#a1aabb">${notice.isDeleted ? `删除于 ${esc(beijingDateTime(notice.deletedAt))}` : `采集于 ${esc(notice.date)}`}</span></div><div class="drawer-actions">${actions}</div></div><div class="drawer-tabs"><button class="filter-tab ${appState.detailTab === 'info' ? 'active' : ''}" data-detail-tab="info">项目信息</button><button class="filter-tab ${appState.detailTab === 'evidence' ? 'active' : ''}" data-detail-tab="evidence">命中证据 <span class="tab-number">${notice.evidence.length}</span></button><button class="filter-tab ${appState.detailTab === 'files' ? 'active' : ''}" data-detail-tab="files">附件文件 <span class="tab-number">${notice.attachments}</span></button></div>${tabContent}`;
 }
 
@@ -655,7 +659,7 @@ function openConfig(kind, existing = null) {
     title.textContent = existing ? '编辑采集任务' : '新建采集任务';
     const sites = appState.sites.map(site => `<option value="${site.id}" ${String(item.site_id || (appState.sites[0] && appState.sites[0].id)) === String(site.id) ? 'selected' : ''}>${esc(site.name)}</option>`).join('');
     const groups = `<option value="">全部启用规则</option>` + appState.keywordGroups.map(group => `<option value="${group.id}" ${String(item.keyword_group_id || '') === String(group.id) ? 'selected' : ''}>${esc(group.name)}</option>`).join('');
-    fields.innerHTML = `${inputField('name','任务名称',item.name || '')}<label class="form-field">采集平台<select name="site_id">${sites}</select></label><label class="form-field">关键词组<select name="keyword_group_id">${groups}</select></label>${inputField('schedule_text','执行计划（每30分钟/每天08:30/工作日08:30/手动）',item.schedule_text || '每 30 分钟', 'text', true)}${inputField('categories','公告类型（逗号分隔）',(item.categories || ['招标公告']).join(', '),'text',true)}${inputField('lookback_days','回溯天数（按北京时间自然日）',item.lookback_days != null ? item.lookback_days : 1,'number',false,'min="0" max="3650"')}${inputField('max_pages','最大页数',item.max_pages || 5,'number',false,'min="1" max="100"')}${inputField('max_notices','最大公告数',item.max_notices || 100,'number',false,'min="1" max="10000"')}${inputField('interval_ms','请求间隔（毫秒）',item.interval_ms || 1500,'number',false,'min="200" max="60000"')}${inputField('retry_max_attempts','最多尝试次数',(item.retry && item.retry.max_attempts) || 3,'number',false,'min="1" max="10"')}<label class="form-field check-field"><input name="download_attachments" type="checkbox" ${existing && !item.download_attachments ? '' : 'checked'}> 下载附件</label><label class="form-field check-field"><input name="enabled" type="checkbox" ${existing && !item.enabled ? '' : 'checked'}> 启用任务</label>`;
+    fields.innerHTML = `${inputField('name','任务名称',item.name || '')}<label class="form-field">采集平台<select name="site_id">${sites}</select></label><label class="form-field">关键词组<select name="keyword_group_id">${groups}</select></label>${inputField('schedule_text','执行计划（每30分钟/每天08:30/工作日08:30/手动）',item.schedule_text || '每 30 分钟', 'text', true)}${inputField('categories','公告类型（逗号分隔）',(item.categories || ['招标公告']).join(', '),'text',true)}${inputField('lookback_days','回溯天数（按北京时间自然日）',item.lookback_days != null ? item.lookback_days : 1,'number',false,'min="0" max="3650"')}${inputField('max_pages','最大页数',item.max_pages || 5,'number',false,'min="1" max="100"')}${inputField('max_notices','最大公告数',item.max_notices || 100,'number',false,'min="1" max="10000"')}${inputField('interval_ms','请求间隔（毫秒）',item.interval_ms || 1500,'number',false,'min="200" max="60000"')}${inputField('retry_max_attempts','最多尝试次数',(item.retry && item.retry.max_attempts) || 3,'number',false,'min="1" max="10"')}<label class="form-field check-field"><input name="download_attachments" type="checkbox" ${existing && !item.download_attachments ? '' : 'checked'}> 下载附件</label><label class="form-field check-field"><input name="ocr_enabled" type="checkbox" ${item.ocr_enabled ? 'checked' : ''}> 扫描附件后台 OCR（CPU）</label><label class="form-field check-field"><input name="enabled" type="checkbox" ${existing && !item.enabled ? '' : 'checked'}> 启用任务</label>`;
   } else if (kind === 'run') {
     title.textContent = '配置本次采集';
     const jobs = appState.jobs.filter(job => job.enabled).map(job => `<option value="${job.id}" ${String((existing && existing.id) || '') === String(job.id) ? 'selected' : ''}>${esc(job.name)}</option>`).join('');
@@ -675,7 +679,7 @@ async function submitConfig(form) {
     if (!payload.name) throw new Error('请输入关键词组名称');
     await apiFetch(existing ? `/api/keyword-groups/${existing.id}` : '/api/keyword-groups', { method: existing ? 'PUT' : 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
   } else if (config.kind === 'job') {
-    const payload = { name:data.get('name').trim(), site_id:Number(data.get('site_id')), account_id:(existing && existing.account_id) || null, keyword_group_id:data.get('keyword_group_id') ? Number(data.get('keyword_group_id')) : null, schedule_text:data.get('schedule_text').trim(), categories:words(data.get('categories')), timezone:'Asia/Shanghai', lookback_days:Number(data.get('lookback_days')), max_pages:Number(data.get('max_pages')), max_notices:Number(data.get('max_notices')), concurrency:(existing && existing.concurrency) || 1, interval_ms:Number(data.get('interval_ms')), retry_max_attempts:Number(data.get('retry_max_attempts')), download_attachments:data.has('download_attachments'), ocr_enabled:Boolean(existing && existing.ocr_enabled), enabled:data.has('enabled') };
+    const payload = { name:data.get('name').trim(), site_id:Number(data.get('site_id')), account_id:(existing && existing.account_id) || null, keyword_group_id:data.get('keyword_group_id') ? Number(data.get('keyword_group_id')) : null, schedule_text:data.get('schedule_text').trim(), categories:words(data.get('categories')), timezone:'Asia/Shanghai', lookback_days:Number(data.get('lookback_days')), max_pages:Number(data.get('max_pages')), max_notices:Number(data.get('max_notices')), concurrency:(existing && existing.concurrency) || 1, interval_ms:Number(data.get('interval_ms')), retry_max_attempts:Number(data.get('retry_max_attempts')), download_attachments:data.has('download_attachments'), ocr_enabled:data.has('ocr_enabled'), enabled:data.has('enabled') };
     if (!payload.name || !payload.schedule_text) throw new Error('任务名称和执行计划不能为空');
     if (!payload.categories.length) throw new Error('请至少填写一种公告类型');
     await apiFetch(existing ? `/api/crawl-jobs/${existing.id}` : '/api/crawl-jobs', { method:existing ? 'PUT':'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
@@ -801,6 +805,8 @@ document.addEventListener('click', event => {
   if (event.target.closest('[data-drawer-restore]')) { const id = appState.detailId; persistRestore([id]).then(() => { closeDetail(); showToast('公告已恢复到公告库'); return loadBackendNotices(false); }).catch(error => showToast(error.message)); return; }
   const reparse = event.target.closest('[data-reparse-notice]');
   if (reparse && appState.detailId) { const noticeId = appState.detailId; apiFetch(`/api/notices/${noticeId}/reparse`, { method: 'POST' }).then(result => { showToast(result.message); void watchReparse(result.task_id, noticeId); }).catch(error => showToast(error.message)); return; }
+  const ocr = event.target.closest('[data-ocr-notice]');
+  if (ocr && appState.detailId) { const noticeId = appState.detailId; apiFetch(`/api/notices/${noticeId}/reparse?ocr=true`, { method: 'POST' }).then(result => { showToast(result.message); void watchReparse(result.task_id, noticeId); }).catch(error => showToast(error.message)); return; }
   const newKeyword = event.target.closest('[data-new-keyword]');
   if (newKeyword) { createKeywordFromUi(); return; }
   const editKeyword = event.target.closest('[data-edit-keyword]');

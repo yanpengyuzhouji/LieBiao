@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-ocr/
 .runtime/
 .env
 .env.*
@@ -18,6 +19,7 @@ release/
 packaging/build/
 packaging/build-*/
 packaging/tools/
+packaging/models/
 
 # Databases, logs and temporary files anywhere
 *.db

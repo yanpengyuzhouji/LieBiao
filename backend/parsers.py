@@ -84,7 +84,7 @@ def parse_text_like(path: Path) -> DocumentResult:
     return DocumentResult(text=text, structure={"format": path.suffix.lower()}, parser="text", status="parsed")
 
 
-def parse_pdf(path: Path) -> DocumentResult:
+def parse_pdf(path: Path, enable_ocr: bool = False) -> DocumentResult:
     try:
         import fitz  # PyMuPDF
 
@@ -94,13 +94,17 @@ def parse_pdf(path: Path) -> DocumentResult:
             page_text = page.get_text("text")
             pages.append({"page": page_number, "text": page_text})
         document.close()
-        return DocumentResult(
+        result = DocumentResult(
             text="\n".join(item["text"] for item in pages),
             structure={"pages": pages},
             parser="pymupdf",
             status="parsed" if any(item["text"].strip() for item in pages) else "ocr_pending",
             error=None if any(item["text"].strip() for item in pages) else "扫描 PDF 未提取到文本，需要启用 OCR",
         )
+        if result.status == "ocr_pending" and enable_ocr:
+            from .ocr import parse_scanned_pdf
+            return parse_scanned_pdf(path)
+        return result
     except Exception as exc:
         return DocumentResult(parser="pymupdf", status="failed", error=f"PDF 解析失败：{exc}")
 
@@ -278,12 +282,12 @@ def _parse_legacy_doc(path: Path) -> DocumentResult:
             pass
 
 
-def parse_document(path: Path) -> DocumentResult:
+def parse_document(path: Path, enable_ocr: bool = False) -> DocumentResult:
     suffix = path.suffix.lower()
     if suffix in {".txt", ".csv", ".log", ".md", ".html", ".htm", ".xml"}:
         return parse_text_like(path)
     if suffix == ".pdf":
-        return parse_pdf(path)
+        return parse_pdf(path, enable_ocr)
     if suffix == ".docx":
         return parse_docx(path)
     if suffix == ".xlsx":

@@ -54,6 +54,9 @@ def health(port):
 
 
 def main():
+    if len(sys.argv) == 6 and sys.argv[1] == '--ocr-worker':
+        from backend.ocr import worker
+        raise SystemExit(worker(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])))
     parser = argparse.ArgumentParser()
     parser.add_argument('--configure-data')
     parser.add_argument('--config-dir')

@@ -34,8 +34,13 @@ from .update_checker import update_monitor
 from .manual_verification import ManualVerificationError, browser_session_port, close_verification, complete_verification, open_verification
 
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 app = FastAPI(title="猎标 V1 API", version=APP_VERSION, docs_url="/api/docs", redoc_url=None)
+PARSE_ISSUE_SQL = """(n.ingest_status='failed' OR EXISTS (
+    SELECT 1 FROM attachments ia WHERE ia.notice_id=n.id
+    AND (ia.parse_status IN ('failed','unsupported','ocr_pending','pending')
+         OR ia.status IN ('failed','needs_tool','not_downloaded','downloading'))
+))"""
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
 
 
@@ -152,7 +157,9 @@ def validate_job_request(payload: JobRequest) -> None:
     if payload.concurrency != 1:
         raise HTTPException(status_code=400, detail="当前版本仅支持单任务串行采集，并发数必须为 1")
     if payload.ocr_enabled:
-        raise HTTPException(status_code=400, detail="当前版本尚未启用 OCR，请关闭 OCR 后保存")
+        from .ocr import available
+        if not available():
+            raise HTTPException(status_code=400, detail="当前程序未包含 CPU OCR 组件，无法启用自动 OCR")
 
 
 def localize(item: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
@@ -392,6 +399,7 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
     if not site:
         raise HTTPException(status_code=404, detail="平台不存在")
     completed = False
+    keep_browser = site["code"] in ("chng", "cdt", "chdtp")
     try:
         try:
             browser_port = None
@@ -402,7 +410,15 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
                 ).fetchone()
                 if account:
                     browser_port = browser_session_port(account["credential_ref"])
-            if browser_port is None:
+            # YFB stores its effective login token in browser storage. A valid
+            # member session therefore may have no cookie at all; the browser
+            # identity and debug port are the actual credential.
+            if site["code"] == "yfb" and browser_port is not None:
+                cookie = (
+                    f"__scout_browser_port={browser_port}; "
+                    f"__scout_browser_session={site_id}"
+                )
+            elif browser_port is None:
                 cookie = complete_verification(site_id)
             else:
                 cookie = complete_verification(site_id, port=browser_port)
@@ -430,7 +446,7 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
                 completed = True
                 return {"ok": True, "mode": "public", "message": message}
             raise ManualVerificationError(f"{session_error}；公开采集检查也未通过：{public_result['message']}") from session_error
-        if site["code"] in ("chng", "cdt", "yfb", "chdtp"):
+        if site["code"] in ("chng", "cdt", "yfb", "chdtp") and "__scout_browser_session=" not in cookie:
             cookie = f"{cookie}; __scout_browser_session={site_id}"
         adapter = make_adapter(site["code"], site["base_url"], session_cookie=cookie)
         try:
@@ -439,6 +455,29 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
             adapter.close()
         if not result["ok"]:
             raise ManualVerificationError(f"验证后仍无法采集：{result['message']}")
+        if site["code"] == "yfb":
+            keep_browser = result.get("mode") == "member"
+        if site["code"] == "yfb" and not keep_browser:
+            with get_db() as connection:
+                timestamp = now_iso()
+                message = "未检测到有效会员权限，已自动切换为公开采集（正文可能不完整）"
+                cursor = connection.execute(
+                    "UPDATE site_accounts SET credential_ref=NULL,session_status='public',last_login_at=?,status_reason=?,enabled=0 WHERE site_id=? AND alias='人工验证会话'",
+                    (timestamp, message, site_id),
+                )
+                if cursor.rowcount == 0:
+                    connection.execute(
+                        "INSERT INTO site_accounts(site_id,alias,login_mode,session_status,last_login_at,status_reason,enabled,created_at) VALUES(?,?,'manual_session','public',?,?,0,?)",
+                        (site_id, "人工验证会话", timestamp, message, timestamp),
+                    )
+                connection.execute("UPDATE crawl_jobs SET account_id=NULL WHERE site_id=?", (site_id,))
+                connection.execute(
+                    "UPDATE sites SET health_status='healthy',health_message=?,last_checked_at=? WHERE id=?",
+                    (message, timestamp, site_id),
+                )
+                log_event(connection, "site.manual_verify", f"{site['name']}：{message}")
+            completed = True
+            return {"ok": True, "mode": "public", "message": message}
         with get_db() as connection:
             account = connection.execute(
                 "SELECT id FROM site_accounts WHERE site_id=? AND alias='人工验证会话' ORDER BY id LIMIT 1", (site_id,)
@@ -459,14 +498,14 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
             connection.execute("UPDATE crawl_jobs SET account_id=? WHERE site_id=?", (account_id, site_id))
             connection.execute(
                 "UPDATE sites SET health_status='healthy',health_message=?,last_checked_at=? WHERE id=?",
-                ("人工验证成功，公开公告列表正常", timestamp, site_id),
+                (result.get("message") or "人工验证成功", timestamp, site_id),
             )
             log_event(connection, "site.manual_verify", f"{site['name']}：人工验证成功，会话已绑定采集任务")
         completed = True
         message = "人工验证成功，已绑定该平台采集任务，可立即采集"
-        if site["code"] in ("chng", "cdt", "yfb", "chdtp"):
+        if keep_browser:
             message += "；该平台定时采集依赖专用窗口，请保持窗口打开"
-        return {"ok": True, "message": message}
+        return {"ok": True, "mode": result.get("mode"), "message": message}
     except ManualVerificationError as exc:
         with get_db() as connection:
             timestamp = now_iso()
@@ -482,7 +521,7 @@ def complete_site_verification(site_id: int) -> dict[str, Any]:
             log_event(connection, "site.manual_verify", f"{site['name']}：{message}", "WARNING")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
-        if completed and site["code"] not in ("chng", "cdt", "yfb", "chdtp"):
+        if completed and not keep_browser:
             close_verification(site_id)
 
 
@@ -763,7 +802,7 @@ def dashboard() -> dict[str, Any]:
     utc_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat(timespec="seconds")
     utc_end = (local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc).isoformat(timespec="seconds")
     with get_db() as connection:
-        counts = connection.execute("""SELECT COUNT(*) total, SUM(created_at>=? AND created_at<?) today_new, SUM(business_mark='pending') pending, SUM(business_mark='focus') focus, SUM(ingest_status IN ('failed','partial')) issues, SUM(ingest_status='parsed') parsed FROM notices n WHERE deleted_at IS NULL AND (source_type<>'crawl' OR EXISTS (SELECT 1 FROM keyword_hits h WHERE h.notice_id=n.id AND h.is_negative=0))""", (utc_start, utc_end)).fetchone()
+        counts = connection.execute(f"""SELECT COUNT(*) total, SUM(created_at>=? AND created_at<?) today_new, SUM(business_mark='pending') pending, SUM(business_mark='focus') focus, SUM({PARSE_ISSUE_SQL}) issues, SUM(ingest_status='parsed') parsed FROM notices n WHERE deleted_at IS NULL AND (source_type<>'crawl' OR EXISTS (SELECT 1 FROM keyword_hits h WHERE h.notice_id=n.id AND h.is_negative=0))""", (utc_start, utc_end)).fetchone()
         platforms = [localize(dict(row), ("last_checked_at",)) for row in connection.execute("SELECT s.id,s.code,s.name,s.health_status,s.health_message,s.last_checked_at,COUNT(n.id) notice_count FROM sites s LEFT JOIN notices n ON n.site_id=s.id AND n.deleted_at IS NULL GROUP BY s.id ORDER BY s.id").fetchall()]
         logs = [localize(dict(row), ("created_at",)) for row in connection.execute("SELECT * FROM system_logs ORDER BY id DESC LIMIT 8").fetchall()]
         runs = [localize(dict(row), ("started_at", "finished_at", "created_at")) for row in connection.execute("SELECT r.*,j.name AS job_name FROM crawl_runs r JOIN crawl_jobs j ON j.id=r.job_id ORDER BY r.id DESC LIMIT 8").fetchall()]
@@ -771,7 +810,7 @@ def dashboard() -> dict[str, Any]:
 
 
 @app.get("/api/notices")
-def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: str = "all", attachment: str = "all", only_issues: bool = False, only_matched: bool = True, only_unmatched: bool = False, include_deleted: bool = False, only_deleted: bool = False, limit: int = Query(default=10, ge=1, le=100), offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
+def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: str = "all", attachment: str = "all", only_issues: bool = False, only_matched: bool = True, only_unmatched: bool = False, include_deleted: bool = False, only_deleted: bool = False, only_today_new: bool = False, limit: int = Query(default=10, ge=1, le=100), offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
     possible_missed_match = """n.source_type='crawl'
         AND NOT EXISTS (SELECT 1 FROM keyword_hits mh WHERE mh.notice_id=n.id AND mh.is_negative=0)
         AND (n.ingest_status IN ('failed','partial') OR EXISTS (
@@ -781,6 +820,9 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
         ))"""
     clauses = ["1=1"]
     params: list[Any] = []
+    local_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    utc_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat(timespec="seconds")
+    utc_end = (local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc).isoformat(timespec="seconds")
     if q:
         clauses.append("(n.title LIKE ? OR n.project_number LIKE ? OR n.demand_unit LIKE ? OR n.summary LIKE ? OR EXISTS (SELECT 1 FROM keyword_hits qh WHERE qh.notice_id=n.id AND qh.is_negative=0 AND (qh.keyword LIKE ? OR qh.snippet LIKE ?)))")
         params.extend([f"%{q}%"] * 6)
@@ -811,8 +853,12 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
     if status != "all":
         clauses.append("n.ingest_status=?"); params.append(status)
     if only_issues:
-        clauses.append("n.ingest_status IN ('failed','partial')")
-    query = f"SELECT n.* FROM notices n LEFT JOIN sites s ON s.id=n.site_id WHERE {' AND '.join(clauses)} ORDER BY COALESCE(n.published_at,n.created_at) DESC LIMIT ? OFFSET ?"
+        clauses.append(PARSE_ISSUE_SQL)
+    if only_today_new:
+        clauses.append("n.created_at>=? AND n.created_at<?")
+        params.extend([utc_start, utc_end])
+    order = "n.created_at DESC" if only_today_new else "COALESCE(n.published_at,n.created_at) DESC"
+    query = f"SELECT n.* FROM notices n LEFT JOIN sites s ON s.id=n.site_id WHERE {' AND '.join(clauses)} ORDER BY {order} LIMIT ? OFFSET ?"
     params.extend([limit, offset])
     with get_db() as connection:
         rows = connection.execute(query, params).fetchall()
@@ -822,9 +868,10 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
             f"""SELECT COUNT(*) AS all_count,
             SUM(n.business_mark='pending') AS pending_count,
             SUM(n.business_mark='focus') AS focus_count,
-            SUM(n.ingest_status IN ('failed','partial')) AS issues_count
+            SUM({PARSE_ISSUE_SQL}) AS issues_count,
+            SUM(n.created_at>=? AND n.created_at<?) AS today_new_count
             FROM notices n LEFT JOIN sites s ON s.id=n.site_id WHERE {facet_where}""",
-            facet_params,
+            [utc_start, utc_end] + facet_params,
         ).fetchone()
         unmatched_count = connection.execute(
             f"SELECT COUNT(*) FROM notices n LEFT JOIN sites s ON s.id=n.site_id WHERE {' AND '.join(scope_clauses)} AND {possible_missed_match}",
@@ -844,6 +891,7 @@ def list_notices(q: str = "", platform: str = "all", mark: str = "all", status: 
             "issues": int(category_counts["issues_count"] or 0),
             "unmatched": int(unmatched_count or 0),
             "trash": int(trash_count or 0),
+            "today_new": int(category_counts["today_new_count"] or 0),
         },
     }
 
@@ -1082,15 +1130,20 @@ def restore_notice(notice_id: int) -> dict[str, Any]:
 
 
 @app.post("/api/notices/{notice_id}/reparse")
-def reparse(notice_id: int, background_tasks: BackgroundTasks) -> dict[str, Any]:
+def reparse(notice_id: int, background_tasks: BackgroundTasks, ocr: bool = False) -> dict[str, Any]:
     validate_id(notice_id)
     try:
-        task_id, created = reparse_tasks.queue(notice_id)
+        if ocr:
+            from .ocr import available
+            if not available():
+                raise HTTPException(status_code=503, detail="未安装 CPU OCR 组件，请使用 Python 3.9-3.13 安装 PaddlePaddle 与 PaddleOCR")
+        task_id, created = reparse_tasks.queue(notice_id, use_ocr=ocr)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if created:
-        background_tasks.add_task(reparse_tasks.execute, task_id)
-    return {"ok": True, "task_id": task_id, "status": "queued", "message": "公告已进入重新解析队列" if created else "该公告正在重新解析，无需重复提交"}
+        reparse_tasks.submit(task_id)
+    label = "OCR 解析" if ocr else "重新解析"
+    return {"ok": True, "task_id": task_id, "status": "queued", "message": f"公告已进入{label}队列" if created else "该公告正在解析，无需重复提交"}
 
 
 @app.get("/api/reparse-tasks/{task_id}")

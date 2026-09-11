@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 from pathlib import Path
 
 project = Path(SPECPATH).parent
@@ -14,6 +14,36 @@ tmp_ret = collect_all('docx')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('openpyxl')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+try:
+    # paddle.jit.sot 在当前环境（PaddlePaddle 3.3.0 / Python 3.12）导入即段错误，
+    # 会导致 PyInstaller 的子模块扫描子进程崩溃退出。运行时不会用到它，故整体排除。
+    tmp_ret = collect_all('paddle', filter_submodules=lambda name: not name.startswith('paddle.jit.sot'),
+                          exclude_datas=['jit/sot'])
+    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+    for package in ('paddleocr', 'paddlex'):
+        tmp_ret = collect_all(package)
+        datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+    # paddlex 在运行时通过 importlib.metadata 校验依赖是否可用，而 PyInstaller 默认
+    # 不打包 .dist-info，冻结后会误判依赖缺失并在建管线时抛 DependencyError。
+    # 故把这三个包及其必需依赖的元数据一并复制进包内。
+    import importlib.metadata
+    from packaging.requirements import Requirement
+    meta_dists = {'paddle', 'paddleocr', 'paddlex'}
+    for dist in ('paddlex', 'paddleocr', 'paddlepaddle'):
+        for requirement in importlib.metadata.requires(dist) or []:
+            # 不区分 extra：base/cv/ocr 等任一 extra 的依赖在校验时同样会被检查，
+            # 未安装的会在 copy_metadata 处被跳过。
+            meta_dists.add(Requirement(requirement).name)
+    for dist in sorted(meta_dists):
+        try:
+            datas += copy_metadata(dist)
+        except Exception:
+            pass
+    model_root = Path(SPECPATH) / 'models'
+    if model_root.exists():
+        datas.append((str(model_root), 'models'))
+except ImportError:
+    pass
 
 
 a = Analysis(
@@ -25,7 +55,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['pandas', 'matplotlib', 'IPython', 'pytest'],
+    excludes=['matplotlib', 'IPython', 'pytest'],
     noarchive=False,
     optimize=0,
 )

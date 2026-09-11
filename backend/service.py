@@ -248,6 +248,23 @@ def text_fragment_url(source_url: str | None, keyword: str) -> str | None:
     return f"{source_url}#{directive}"
 
 
+def keyword_locator_url(site_code: str, source_url: str | None,
+                        external_id: str | None, keyword: str) -> str | None:
+    if site_code != "yfb":
+        return text_fragment_url(source_url, keyword)
+    encoded = quote(keyword, safe="")
+    if source_url and "qiye.qianlima.com" in source_url and "/infoCenter/infoDetail/" in source_url:
+        separator = "&" if "?" in urlparse(source_url).fragment else "?"
+        return f"{source_url}{separator}searchKeyWord={encoded}"
+    if external_id:
+        return (
+            "https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/infoDetail/"
+            f"{quote(str(external_id), safe='')}/1/zhaobiao"
+            f"?fromPage=searchPage&searchKeyWord={encoded}"
+        )
+    return source_url
+
+
 def frontend_notice(connection, row) -> dict[str, Any]:
     code, name, base_url = site_name(connection, row["site_id"])
     hits = get_hits(connection, row["id"])
@@ -266,13 +283,13 @@ def frontend_notice(connection, row) -> dict[str, Any]:
     evidence = [{
         "id": str(hit["id"]), "key": hit["keyword"], "loc": hit["location"] or "正文", "copy": hit["snippet"] or "命中关键词：" + hit["keyword"],
         "source": (hit["source_file"] or "公告正文.html"), "sourceType": hit["source_type"],
-        "locatorUrl": file_urls.get(hit["source_file"]) if hit["source_type"].startswith("attachment") else text_fragment_url(row["source_url"], hit["keyword"]),
+        "locatorUrl": file_urls.get(hit["source_file"]) if hit["source_type"].startswith("attachment") else keyword_locator_url(code, row["source_url"], row["external_id"], hit["keyword"]),
         "locatorFileId": next((str(file["id"]) for file in files if file["name"] == hit["source_file"] and file["relative_path"]), None) if hit["source_type"].startswith("attachment") else None,
         "locatorLabel": "定位本地文件" if hit["source_type"].startswith("attachment") and file_urls.get(hit["source_file"]) else "附件未落盘" if hit["source_type"].startswith("attachment") else "定位 ↗",
     } for hit in hits]
     file_items = [{
         "id": str(file["id"]), "name": file["name"], "type": Path(file["name"]).suffix.lower().lstrip(".") or "file", "size": format_bytes(file["size_bytes"]),
-        "nested": bool(file["parent_attachment_id"]), "key": bool(file["is_key_file"]), "error": file["error_message"],
+        "nested": bool(file["parent_attachment_id"]), "key": bool(file["is_key_file"]), "error": file["error_message"], "parseStatus": file["parse_status"],
         "previewUrl": f"/api/files/{file['id']}/preview" if file["relative_path"] else None,
         "openLocationUrl": f"/api/files/{file['id']}/open-location" if file["relative_path"] else None,
     } for file in files]
@@ -395,11 +412,16 @@ def save_streamed_attachment(adapter: BaseAdapter, notice_id: int, attachment_id
     try:
         with adapter.client.stream("GET", source_url) as response:
             response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
             advertised = int(response.headers.get("content-length", "0") or 0)
             if advertised > max_bytes:
                 raise ValueError(f"附件超过大小限制（{settings.max_attachment_mb} MB）")
             with path.open("wb") as handle:
                 for chunk in response.iter_bytes(1024 * 1024):
+                    if total == 0 and path.suffix.lower() not in {".html", ".htm", ".txt"}:
+                        sample = chunk.lstrip()[:256].lower()
+                        if "text/html" in content_type or sample.startswith((b"<!doctype html", b"<html")):
+                            raise ValueError("附件地址返回了网页而非文件，可能需要会员会话或下载权限")
                     total += len(chunk)
                     if total > max_bytes:
                         raise ValueError(f"附件超过大小限制（{settings.max_attachment_mb} MB）")
@@ -412,9 +434,19 @@ def save_streamed_attachment(adapter: BaseAdapter, notice_id: int, attachment_id
     return path, total, digest.hexdigest()
 
 
-def process_local_attachment(connection, notice_id: int, attachment_id: int, path: Path, name: str, parent_id: int | None = None) -> list[dict[str, str]]:
+def process_local_attachment(connection, notice_id: int, attachment_id: int, path: Path, name: str, parent_id: int | None = None, enable_ocr: bool = False) -> list[dict[str, str]]:
     """Persist parser output and return searchable source blocks."""
     sources: list[dict[str, str]] = []
+    compact_name = re.sub(r"\s+", "", name).lower()
+    if any(marker in compact_name for marker in (
+        "招文修改建议", "异议书（模板）", "异议书(模板)", "投诉书函（模板）", "投诉书函(模板)",
+        "招标人声明（适用于", "招标人声明(适用于", "供应商操作指引", "投标人部分）", "投标人部分)",
+    )):
+        connection.execute(
+            "UPDATE attachments SET status='stored',parse_status='ignored',error_message=NULL WHERE id=? AND notice_id=?",
+            (attachment_id, notice_id),
+        )
+        return sources
     if is_office_lock_file(name):
         connection.execute("DELETE FROM attachments WHERE id=?", (attachment_id,))
         return sources
@@ -441,7 +473,7 @@ def process_local_attachment(connection, notice_id: int, attachment_id: int, pat
                 ).fetchone()
                 child_id = int(existing_child["id"]) if existing_child else create_attachment(connection, notice_id, child_name, None, "extracted", attachment_id)
                 connection.execute("UPDATE attachments SET relative_path=?,mime_type=?,size_bytes=?,sha256=? WHERE id=?", (relative, file_mime(child), child.stat().st_size, sha256_file(child), child_id))
-                sources.extend(process_local_attachment(connection, notice_id, child_id, child, child_name, attachment_id))
+                sources.extend(process_local_attachment(connection, notice_id, child_id, child, child_name, attachment_id, enable_ocr))
             return sources
         except Exception as exc:
             error = str(exc)
@@ -449,7 +481,7 @@ def process_local_attachment(connection, notice_id: int, attachment_id: int, pat
             return sources
     # Parsing may call Word for tens of seconds; release SQLite's writer first.
     connection.commit()
-    result = parse_document(path)
+    result = parse_document(path, enable_ocr=True) if enable_ocr else parse_document(path)
     if not connection.execute(
         "SELECT 1 FROM attachments WHERE id=? AND notice_id=?", (attachment_id, notice_id)
     ).fetchone():
@@ -540,7 +572,7 @@ def discard_unmatched_notice(connection, notice_id: int) -> None:
             pass
 
 
-def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapter: BaseAdapter | None = None, source_type: str = "crawl", download_attachments: bool = True, keyword_group_id: int | None = None, filter_unmatched: bool = False, crawl_job_id: int | None = None, crawl_run_id: int | None = None) -> int | None:
+def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapter: BaseAdapter | None = None, source_type: str = "crawl", download_attachments: bool = True, keyword_group_id: int | None = None, filter_unmatched: bool = False, crawl_job_id: int | None = None, crawl_run_id: int | None = None, retain_ocr_pending: bool = False) -> int | None:
     timestamp = now_iso()
     fingerprint = hashlib.sha256((data.title + "\n" + data.body_text).encode("utf-8", errors="ignore")).hexdigest()
     if is_permanently_deleted(connection, site_id, data.external_id, data.url):
@@ -619,7 +651,8 @@ def ingest_notice_data(connection, site_id: int | None, data: NoticeData, adapte
         ensure_notice_binding_schema(connection)
         connection.execute("INSERT INTO notice_keyword_bindings(notice_id,job_id,keyword_group_id,first_run_id,last_run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(notice_id,job_id,keyword_group_id) DO UPDATE SET last_run_id=excluded.last_run_id,updated_at=excluded.updated_at", (notice_id, crawl_job_id, keyword_group_id, crawl_run_id, crawl_run_id, timestamp, timestamp))
     matched_groups = refresh_notice_analysis(connection, notice_id, data.title, data.body_text, keyword_group_id)
-    if filter_unmatched and matched_groups == 0 and not data.collection_warning:
+    pending_ocr = bool(connection.execute("SELECT 1 FROM attachments WHERE notice_id=? AND parse_status='ocr_pending' LIMIT 1", (notice_id,)).fetchone())
+    if filter_unmatched and matched_groups == 0 and not data.collection_warning and not (retain_ocr_pending and pending_ocr):
         if created_new:
             discard_unmatched_notice(connection, notice_id)
         return None
@@ -683,8 +716,6 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
     unsupported = []
     if int(job.get("concurrency") or 1) != 1:
         unsupported.append("并发采集")
-    if bool(job.get("ocr_enabled")):
-        unsupported.append("OCR")
     if unsupported:
         message = f"当前版本不支持{'、'.join(unsupported)}，任务已停止；请修正任务配置"
         with get_db() as connection:
@@ -793,8 +824,9 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
                     data.published_at = effective_published_at
                 with get_db() as connection:
                     existing = connection.execute("SELECT id FROM notices WHERE site_id IS ? AND (external_id=? OR source_url=?) ORDER BY id LIMIT 1", (job["site_id"], data.external_id, data.url)).fetchone()
-                    notice_id = ingest_notice_data(connection, job["site_id"], data, adapter, download_attachments=bool(job["download_attachments"]), keyword_group_id=job["keyword_group_id"], filter_unmatched=True, crawl_job_id=job_id, crawl_run_id=run_id)
+                    notice_id = ingest_notice_data(connection, job["site_id"], data, adapter, download_attachments=bool(job["download_attachments"]), keyword_group_id=job["keyword_group_id"], filter_unmatched=True, crawl_job_id=job_id, crawl_run_id=run_id, retain_ocr_pending=bool(job.get("ocr_enabled")))
                     needs_review = bool(notice_id and data.collection_warning and not connection.execute("SELECT 1 FROM keyword_hits WHERE notice_id=? AND is_negative=0 LIMIT 1", (notice_id,)).fetchone())
+                    needs_ocr = bool(notice_id and job.get("ocr_enabled") and connection.execute("SELECT 1 FROM attachments WHERE notice_id=? AND parse_status='ocr_pending' LIMIT 1", (notice_id,)).fetchone())
                 if notice_id is None:
                     filtered += 1
                     continue
@@ -806,6 +838,11 @@ def run_crawl(job_id: int, run_id: int, overrides: dict[str, Any] | None = None,
                     duplicates += 1
                 attachments += len(data.attachments)
                 parsed += 1
+                if needs_ocr:
+                    from . import reparse_tasks
+                    task_id, created_task = reparse_tasks.queue(notice_id, use_ocr=True)
+                    if created_task:
+                        reparse_tasks.submit(task_id)
             except Exception as exc:
                 failed += 1
                 reason = str(exc)
@@ -860,7 +897,7 @@ def try_create_run(job_id: int, reset_schedule: bool = False) -> int | None:
 
 
 @tracked
-def reparse_notice(notice_id: int) -> None:
+def reparse_notice(notice_id: int, enable_ocr: bool = False) -> None:
     with get_db() as connection:
         notice = connection.execute("SELECT title FROM notices WHERE id=?", (notice_id,)).fetchone()
         version = connection.execute("SELECT body_text FROM notice_versions WHERE notice_id=? ORDER BY version_no DESC LIMIT 1", (notice_id,)).fetchone()
@@ -889,7 +926,7 @@ def reparse_notice(notice_id: int) -> None:
             if attachment["relative_path"]:
                 path = absolute_from_relative(attachment["relative_path"])
                 if path.exists():
-                    process_local_attachment(connection, notice_id, attachment["id"], path, attachment["name"])
+                    process_local_attachment(connection, notice_id, attachment["id"], path, attachment["name"], enable_ocr=enable_ocr)
                 else:
                     connection.execute("UPDATE attachments SET parse_status='failed',error_message='本地文件不存在，保留上次解析结果' WHERE id=?", (attachment["id"],))
         ensure_notice_binding_schema(connection)

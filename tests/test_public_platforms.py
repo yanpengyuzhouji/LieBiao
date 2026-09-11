@@ -37,7 +37,9 @@ class PublicPlatformTests(unittest.TestCase):
 
     @patch('backend.manual_verification.browser_request')
     def test_yfb_verified_enterprise_uses_browser_and_new_search_api(self, browser_request):
-        browser_request.return_value = {'code': 200, 'data': {'resultList': [
+        browser_request.side_effect = [
+            {'code': 200, 'data': {'accountType': 2, 'endTime': '2030-07-11'}},
+            {'code': 200, 'data': {'resultList': [
             {
                 'contentId': 629767947, 'title': '建设项目招标计划',
                 'type': '招标计划', 'updateTime': '2026-09-10 10:47:59',
@@ -47,7 +49,8 @@ class PublicPlatformTests(unittest.TestCase):
                 'title': '高效永磁同步电机招标公告',
                 'type': '招标公告', 'updateTime': '2026-09-10 10:47:57',
             },
-        ]}}
+        ]}},
+        ]
         with patch('backend.adapters.detect_outbound_proxy', return_value=None):
             adapter = YfbAdapter(
                 'https://www.yfbzb.com/search/?keywords=设备',
@@ -61,11 +64,78 @@ class PublicPlatformTests(unittest.TestCase):
 
         rows = adapter.list_notices(1, 1)
 
-        requested_url = browser_request.call_args.args[1]
+        requested_url = browser_request.call_args_list[1].args[1]
         self.assertIn('qiye.qianlima.com/new_qd_yfbsite/api/search?', requested_url)
         self.assertIn('pageSize=30', requested_url)
-        self.assertEqual(browser_request.call_args.kwargs['storage_query'], {'openid': 'YFB-OpenId'})
-        self.assertEqual(rows[0].url, 'https://www.yfbzb.com/inviteBid/detail/20260910_629767931.html')
+        self.assertEqual(browser_request.call_args_list[1].kwargs['storage_query'], {'openid': 'YFB-OpenId'})
+        self.assertIn('/infoCenter/infoDetail/629767931/137/zhaobiao', rows[0].url)
+
+    @patch('backend.manual_verification.browser_page_json')
+    def test_yfb_member_detail_uses_enterprise_content_and_attachments(self, browser_page_json):
+        browser_page_json.return_value = {'code': 200, 'data': {
+            'contentId': 629767931, 'title': '<font>储能</font>设备招标公告', 'type': '招标公告',
+            'content': '<p>会员完整正文，投标截止时间：2026-09-20 09:00</p>',
+            'updateDate': '2026/09/10', 'downlinkList': [
+                {'title': '技术规范.pdf', 'url': 'https://files.example.com/spec.pdf'},
+                {'title': '招标文件.docx', 'url': 'http://www.qianlima.com/downloads/agent.jsp?req=signed'},
+                {'title': '错误详情链接.pdf', 'url': 'https://qiye.qianlima.com//#/infoCenter/infoDetail/1/1/zhaobiao'},
+            ],
+        }}
+        with patch('backend.adapters.detect_outbound_proxy', return_value=None):
+            adapter = YfbAdapter(
+                'https://www.yfbzb.com/inviteBid/',
+                session_cookie='__scout_browser_session=47; __scout_browser_port=62430',
+            )
+        self.addCleanup(adapter.close)
+
+        data = adapter.fetch_notice(
+            'https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/infoDetail/629767931/137/zhaobiao'
+        )
+
+        self.assertIn('会员完整正文', data.body_text)
+        self.assertEqual(data.title, '储能设备招标公告')
+        self.assertIsNone(data.collection_warning)
+        self.assertEqual(data.attachments[0].name, '技术规范.pdf')
+        self.assertEqual(len(data.attachments), 2)
+        self.assertEqual(data.attachments[1].url, 'https://www.qianlima.com/downloads/agent.jsp?req=signed')
+        self.assertEqual('/subZhaobiao/zbDetail', browser_page_json.call_args.args[2])
+
+    @patch('backend.manual_verification.browser_page_json')
+    def test_yfb_member_detail_never_silently_falls_back_to_public(self, browser_page_json):
+        browser_page_json.return_value = {'code': 200, 'data': {'errType': 6}}
+        with patch('backend.adapters.detect_outbound_proxy', return_value=None):
+            adapter = YfbAdapter(
+                'https://www.yfbzb.com/inviteBid/',
+                session_cookie='__scout_browser_session=47; __scout_browser_port=62430',
+            )
+        self.addCleanup(adapter.close)
+
+        with self.assertRaisesRegex(AdapterError, '会员详情未返回完整正文'):
+            adapter.fetch_notice(
+                'https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/infoDetail/'
+                '629767931/137/zhaobiao?fromPage=searchPage&published=20260910'
+            )
+
+    @patch('backend.manual_verification.browser_request')
+    def test_yfb_expired_membership_automatically_uses_public_list(self, browser_request):
+        browser_request.return_value = {
+            'code': 200, 'data': {'accountType': 2, 'endTime': '2020-01-01'},
+        }
+        raw = '<tr><td><a href="/inviteBid/detail/20260910_123.html">设备招标公告</a></td><td>2026-09-10</td></tr>'
+        with patch('backend.adapters.detect_outbound_proxy', return_value=None):
+            adapter = YfbAdapter(
+                'https://www.yfbzb.com/inviteBid/',
+                session_cookie='__scout_browser_session=47; __scout_browser_port=62430',
+            )
+        adapter.client.close()
+        adapter.client = httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, request=request, text=raw)
+        ))
+        self.addCleanup(adapter.close)
+
+        rows = adapter.list_notices(1, 1)
+
+        self.assertEqual(rows[0].url, 'https://www.yfbzb.com/inviteBid/detail/20260910_123.html')
 
     def test_yfb_ignores_sidebar_and_keeps_hidden_warning(self):
         adapter = self.adapter(YfbAdapter, lambda _: httpx.Response(200, text='<h1>设备招标公告</h1><div class="content">公开正文<br/>***<a href="/a.pdf">技术文件.pdf</a></div><aside>储能广告</aside>'))
@@ -73,6 +143,14 @@ class PublicPlatformTests(unittest.TestCase):
         self.assertNotIn('储能广告', data.body_text)
         self.assertTrue(data.collection_warning)
         self.assertEqual(data.attachments[0].name, '技术文件.pdf')
+
+    def test_yfb_member_page_routes_are_not_downloadable_attachments(self):
+        raw = '''<html><h1>设备公开招标公告</h1><div class="content">公开正文
+        <a href="https://qiye.qianlima.com//#/infoCenter/infoDetail/1/1/zhaobiao">附件.pdf</a>
+        <a href="http://www.qianlima.com/downloads/agent.jsp?req=">招标附件.zip</a></div></html>'''
+        adapter = self.adapter(YfbAdapter, lambda _: httpx.Response(200, text=raw))
+        data = adapter.fetch_notice('https://www.yfbzb.com/inviteBid/detail/20260910_123.html')
+        self.assertEqual(data.attachments, [])
 
     def test_yfb_does_not_misclassify_opening_records_or_document_publications(self):
         for title, expected in [('工程项目开标记录', '开标记录'), ('工程施工招标文件', '招标文件'), ('设备招标终止公告', '终止公告')]:

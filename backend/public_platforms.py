@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date
 from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
@@ -13,6 +14,12 @@ from .adapters import (
     AdapterError, AttachmentInfo, BaseAdapter, NoticeData, NoticeSummary,
     PageParser, clean_text, first_date,
 )
+
+
+def plain_html(value: object) -> str:
+    parser = PageParser()
+    parser.feed(str(value or ""))
+    return re.sub(r"\s+", " ", "".join(parser.text_parts)).strip()
 
 
 def notice_type(title: str, default: str = "招标公告") -> str:
@@ -108,12 +115,53 @@ class PublicAdapter(BaseAdapter):
 
 class YfbAdapter(PublicAdapter):
     code = "yfb"
+    enterprise_root = "https://qiye.qianlima.com/new_qd_yfbsite/"
     enterprise_list_url = "https://qiye.qianlima.com/new_qd_yfbsite/api/search"
+    enterprise_member_url = "https://qiye.qianlima.com/new_qd_yfbsite/api/enterprise/selectUserVipInfo"
+    enterprise_detail_url = "https://qiye.qianlima.com/new_qd_yfbsite/api/subZhaobiao/zbDetail"
     public_detail_url = "https://www.yfbzb.com/inviteBid/detail/{date}_{external_id}.html"
 
+    def health_check(self):
+        try:
+            member = bool(self.browser_site_id and self._is_active_member())
+            rows = (self._list_verified_enterprise(1, 1) if member else self._list_public(1, 1))
+            if not rows:
+                return {"ok": False, "message": "列表没有可识别公告，无法确认可采集", "status_code": None}
+            detail = self.fetch_notice(rows[0].url, rows[0].external_id)
+            mode = "member" if member else "public"
+            message = ("会员采集正常" if member else "公开采集正常，正文可能不完整")
+            return {"ok": True, "mode": mode, "message": detail.collection_warning or message, "status_code": 200}
+        except (AdapterError, ValueError, KeyError, TypeError) as exc:
+            return {"ok": False, "message": str(exc), "status_code": None}
+
     def list_notices(self, max_pages=1, max_notices=100, list_url=None, exclude_external_ids=None):
-        if getattr(self, "browser_site_id", None):
+        if getattr(self, "browser_site_id", None) and self._is_active_member():
             return self._list_verified_enterprise(max_pages, max_notices, exclude_external_ids)
+        return self._list_public(max_pages, max_notices, list_url, exclude_external_ids)
+
+    def _browser_json(self, url):
+        from .manual_verification import ManualVerificationError, browser_request
+        try:
+            payload = browser_request(
+                self.browser_site_id, url, port=self.browser_port,
+                storage_query={"openid": "YFB-OpenId"}, authorization_cookie="Admin-Token",
+            )
+        except ManualVerificationError as exc:
+            raise AdapterError(f"乙方宝企业接口访问失败：{exc}") from exc
+        if not isinstance(payload, dict) or payload.get("code") != 200:
+            message = payload.get("msg") if isinstance(payload, dict) else "响应格式异常"
+            raise AdapterError(f"乙方宝企业接口访问失败：{message or '登录会话无效'}")
+        return payload
+
+    def _is_active_member(self):
+        if hasattr(self, "_member_mode"):
+            return self._member_mode
+        data = (self._browser_json(self.enterprise_member_url).get("data") or {})
+        end_time = str(data.get("endTime") or "")[:10]
+        self._member_mode = bool(data.get("accountType") and end_time >= date.today().isoformat())
+        return self._member_mode
+
+    def _list_public(self, max_pages=1, max_notices=100, list_url=None, exclude_external_ids=None):
         result, seen = [], set()
         excluded = exclude_external_ids or set()
         for page in range(1, max_pages + 1):
@@ -153,27 +201,17 @@ class YfbAdapter(PublicAdapter):
         result, seen = [], set()
         excluded = exclude_external_ids or set()
         for page in range(1, max_pages + 1):
-            try:
-                from .manual_verification import ManualVerificationError, browser_request
-                query = urlencode({
-                    "pageSize": 30, "pageNum": page, "pageFrom": "zhaobiao",
-                    "keyword": "", "filterCondition": 1, "searchType": "1", "timeOption": "2",
-                    "viewMonitor": "false", "defTimeFlag": "0",
-                })
-                payload = browser_request(
-                    self.browser_site_id, f"{self.enterprise_list_url}?{query}",
-                    port=self.browser_port, storage_query={"openid": "YFB-OpenId"},
-                )
-            except ManualVerificationError as exc:
-                raise AdapterError(f"乙方宝企业公告列表访问失败：{exc}") from exc
-            if not isinstance(payload, dict) or payload.get("code") != 200:
-                message = payload.get("msg") if isinstance(payload, dict) else "响应格式异常"
-                raise AdapterError(f"乙方宝企业公告列表访问失败：{message or '登录会话无效'}")
+            query = urlencode({
+                "pageSize": 30, "pageNum": page, "pageFrom": "zhaobiao",
+                "keyword": "", "filterCondition": 1, "searchType": "1", "timeOption": "2",
+                "viewMonitor": "false", "defTimeFlag": "0",
+            })
+            payload = self._browser_json(f"{self.enterprise_list_url}?{query}")
             rows = (payload.get("data") or {}).get("resultList") or []
             progress = False
             for row in rows:
                 external_id = str(row.get("contentId") or "").strip()
-                title = clean_text([str(row.get("title") or "")])
+                title = plain_html(row.get("title"))
                 if not external_id or not title:
                     continue
                 if external_id in seen:
@@ -186,9 +224,11 @@ class YfbAdapter(PublicAdapter):
                 if not dates:
                     continue
                 published_at = dates[0]
+                area_id = str(row.get("areaId") or "2703")
                 result.append(NoticeSummary(
                     external_id, title,
-                    self.public_detail_url.format(date=published_at.replace("-", ""), external_id=external_id),
+                    f"{self.enterprise_root}#/infoCenter/infoDetail/{external_id}/{area_id}/zhaobiao"
+                    f"?fromPage=searchPage&published={published_at.replace('-', '')}",
                     published_at, "招标公告",
                 ))
                 if len(result) >= max_notices:
@@ -200,6 +240,10 @@ class YfbAdapter(PublicAdapter):
         return result
 
     def fetch_notice(self, url, external_id=None, detail_id=None):
+        parsed = urlparse(url)
+        enterprise_match = re.search(r"/infoCenter/infoDetail/(\d+)/([^/?]+)/zhaobiao", parsed.fragment)
+        if enterprise_match and self.browser_site_id:
+            return self._fetch_enterprise_notice(url, enterprise_match[1], enterprise_match[2])
         match = re.search(r"/inviteBid/detail/(\d{8})_(\d+)\.html", urlparse(url).path)
         if not match:
             raise AdapterError("请输入乙方宝公告详情链接")
@@ -222,13 +266,55 @@ class YfbAdapter(PublicAdapter):
         elif kind == "其他公告" and re.search(r"招标公告|(?:采用|进行|通过|现对|采购方式[：:\s]*).{0,30}公开招标", body):
             kind = "招标公告"
         day = match[1]
+        attachments = self._attachments_from_links(parser.links, url)
+        attachments = [item for item in attachments if not (
+            ((urlparse(item.url).hostname or "").lower() == "qiye.qianlima.com" and urlparse(item.url).fragment.startswith("/infoCenter/"))
+            or (urlparse(item.url).path.endswith("/downloads/agent.jsp") and not parse_qs(urlparse(item.url).query, keep_blank_values=False).get("req"))
+        )]
         return NoticeData(
             external_id or match[2], title, url, body, raw,
             published_at=f"{day[:4]}-{day[4:6]}-{day[6:]}",
             opening_at=first_date(body, ("开标时间", "投标截止时间")),
-            notice_type=kind, attachments=self._attachments_from_links(parser.links, url),
+            notice_type=kind, attachments=attachments,
             collection_warning=warning,
         )
+
+    def _fetch_enterprise_notice(self, url, external_id, area_id):
+        from .manual_verification import ManualVerificationError, browser_page_json
+        try:
+            payload = browser_page_json(
+                self.browser_site_id, url, "/subZhaobiao/zbDetail",
+                port=self.browser_port,
+            )
+        except ManualVerificationError as exc:
+            raise AdapterError(f"乙方宝会员详情访问失败：{exc}") from exc
+        data = payload.get("data") or {}
+        if data.get("errType") or not data.get("content"):
+            reason = data.get("errMsg") or data.get("msg") or data.get("errType") or "响应正文为空"
+            raise AdapterError(f"乙方宝会员详情未返回完整正文（{reason}），未降级采集公开页面")
+        raw = str(data.get("content") or "")
+        parser = PageParser()
+        parser.feed(raw)
+        body = clean_text(parser.text_parts)
+        published = str(data.get("updateDate") or "").replace("/", "-")[:10] or None
+        attachments = []
+        for item in data.get("downlinkList") or []:
+            attachment_url = str(item.get("url") or "").strip()
+            parsed_attachment = urlparse(attachment_url)
+            if not attachment_url or parsed_attachment.fragment.startswith("/infoCenter/"):
+                continue
+            if parsed_attachment.hostname in {"qianlima.com", "www.qianlima.com"} and parsed_attachment.scheme == "http":
+                attachment_url = parsed_attachment._replace(scheme="https").geturl()
+            attachments.append(AttachmentInfo(plain_html(item.get("title") or "附件"), attachment_url))
+        return NoticeData(
+            external_id, plain_html(data.get("title") or external_id), url, body, raw,
+            published_at=published,
+            opening_at=str(data.get("openBidTime") or "") or first_date(body, ("开标时间", "投标截止时间")),
+            notice_type=notice_type(str(data.get("title") or "")), attachments=attachments,
+        )
+
+    def _fetch_public_notice(self, url, external_id=None):
+        return self.fetch_notice(url, external_id)
 
 
 class NeepAdapter(PublicAdapter):

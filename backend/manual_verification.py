@@ -67,12 +67,12 @@ def _attach_session(site_id: int, port: int, expected_host: str | None = None) -
         raise ManualVerificationError("专用验证窗口已关闭，请重新打开人工验证") from exc
     target = next((item for item in targets if item.get("type") == "page"
                    and item.get("webSocketDebuggerUrl")
-                   and (urlparse(item.get("url", "")).hostname or "").lower()), None)
+                   and (urlparse(item.get("url", "")).hostname or "").lower()
+                   and (not expected_host or
+                        (urlparse(item.get("url", "")).hostname or "").lower() == expected_host.lower())), None)
     if not target:
         raise ManualVerificationError("未找到验证页面，请保持专用验证窗口打开")
     host = (urlparse(target.get("url", "")).hostname or "").lower()
-    if expected_host and host != expected_host.lower():
-        raise ManualVerificationError("浏览器验证页面与平台不一致，请打开正确的平台页面")
     session = BrowserSession(port=port, process=None, host=host)
     with _lock:
         _sessions[site_id] = session
@@ -136,7 +136,8 @@ def _cookie_header(cookies: list[dict[str, object]], host: str) -> str:
 def browser_request(site_id: int, url: str, method: str = "GET", payload: dict | None = None,
                     port: int | None = None, form_encoded: bool = False,
                     parse_json: bool = True,
-                    storage_query: dict[str, str] | None = None) -> dict | str:
+                    storage_query: dict[str, str] | None = None,
+                    authorization_cookie: str | None = None) -> dict | str:
     """Run a same-origin public request inside an open verified Edge page."""
     with _lock:
         session = _sessions.get(site_id)
@@ -165,8 +166,16 @@ def browser_request(site_id: int, url: str, method: str = "GET", payload: dict |
             + ";for(const [p,k] of Object.entries(q)){const v=localStorage.getItem(k);if(v)u.searchParams.set(p,v)}"
             + "return u.toString()})()"
         )
+    auth_setup = ""
+    if authorization_cookie:
+        auth_setup = (
+            "const n=" + json.dumps(authorization_cookie) + ";"
+            + "const c=document.cookie.split('; ').find(x=>x.startsWith(n+'='));"
+            + "if(c)o.headers.Authorization='Bearer '+c.slice(n.length+1);"
+        )
     expression = (
-        "(async()=>{const r=await fetch(" + request_url + "," + json.dumps(options, ensure_ascii=False)
+        "(async()=>{const o=" + json.dumps(options, ensure_ascii=False) + ";" + auth_setup
+        + "const r=await fetch(" + request_url + ",o"
         + ");return JSON.stringify({status:r.status,text:await r.text()})})()"
     )
     with connect(target["webSocketDebuggerUrl"], origin=f"http://127.0.0.1:{session.port}", open_timeout=5) as websocket:
@@ -184,6 +193,60 @@ def browser_request(site_id: int, url: str, method: str = "GET", payload: dict |
                 raise ManualVerificationError(f"浏览器采集请求返回 {result.get('status') or '未知状态'}")
             text = result.get("text") or ""
             return json.loads(text or "{}") if parse_json else text
+
+
+def browser_page_json(site_id: int, page_url: str, api_marker: str,
+                      port: int | None = None) -> dict:
+    """Navigate the verified page and return one JSON API response made by the site itself."""
+    expected_host = (urlparse(page_url).hostname or "").lower()
+    with _lock:
+        session = _sessions.get(site_id)
+    if not session and port:
+        session = _attach_session(site_id, port, expected_host)
+    if not session or not _process_alive(session.process) and session.process is not None:
+        raise ManualVerificationError("专用采集窗口已关闭，请在“平台与账号”重新打开后采集")
+    if expected_host != session.host:
+        raise ManualVerificationError("浏览器采集请求地址与验证平台不一致")
+    targets = httpx.get(f"http://127.0.0.1:{session.port}/json", timeout=3).json()
+    target = next((item for item in targets if item.get("type") == "page"
+                   and item.get("webSocketDebuggerUrl")
+                   and (urlparse(item.get("url", "")).hostname or "").lower() == session.host), None)
+    if not target:
+        raise ManualVerificationError("未找到平台公告页面，请保持专用窗口打开")
+    request_id = None
+    deadline = time.monotonic() + 30
+    # Hash-router pages can reuse the detail component without issuing XHR.
+    # Rebuild the document first; the persistent browser profile keeps login
+    # storage while every notice gets its own observable detail request.
+    separator = "&" if "?" in urlparse(page_url).fragment else "?"
+    nonce = time.time_ns()
+    navigation_url = f"{page_url}{separator}_scout={nonce}"
+    detail_navigation_started = False
+    with connect(target["webSocketDebuggerUrl"], origin=f"http://127.0.0.1:{session.port}", open_timeout=5) as websocket:
+        websocket.send(json.dumps({"id": 1, "method": "Network.enable"}))
+        websocket.send(json.dumps({"id": 5, "method": "Page.enable"}))
+        websocket.send(json.dumps({"id": 2, "method": "Page.navigate", "params": {"url": "about:blank"}}))
+        while time.monotonic() < deadline:
+            try:
+                event = json.loads(websocket.recv(timeout=max(1, deadline - time.monotonic())))
+            except TimeoutError:
+                break
+            params = event.get("params") or {}
+            if event.get("method") == "Page.loadEventFired" and not detail_navigation_started:
+                detail_navigation_started = True
+                websocket.send(json.dumps({"id": 4, "method": "Page.navigate", "params": {"url": navigation_url}}))
+            if event.get("method") == "Network.responseReceived":
+                response_url = ((params.get("response") or {}).get("url") or "")
+                if api_marker in response_url:
+                    request_id = params.get("requestId")
+            if request_id and event.get("method") == "Network.loadingFinished" and params.get("requestId") == request_id:
+                websocket.send(json.dumps({"id": 3, "method": "Network.getResponseBody", "params": {"requestId": request_id}}))
+            if event.get("id") == 3:
+                try:
+                    return json.loads((event.get("result") or {}).get("body") or "{}")
+                except (TypeError, ValueError) as exc:
+                    raise ManualVerificationError("会员详情响应格式异常") from exc
+    raise ManualVerificationError("会员详情加载超时，请刷新专用窗口后重试")
 
 
 def complete_verification(site_id: int, port: int | None = None) -> str:

@@ -13,12 +13,25 @@ from backend.config import settings
 from backend.db import get_db, init_db, now_iso
 from backend.main import app, list_notices, site_health_check
 from backend.parsers import DocumentResult
-from backend.service import attachment_tree_needs_reparse, create_attachment, find_site, ingest_notice_data, permanently_delete_notices, process_local_attachment, refresh_notice_analysis, try_create_run
+from backend.service import attachment_tree_needs_reparse, create_attachment, find_site, ingest_notice_data, keyword_locator_url, permanently_delete_notices, process_local_attachment, refresh_notice_analysis, try_create_run
 from backend.stabilization_migration import migrate_stabilization_schema
 from backend.storage import save_raw_html
 
 
 class StabilityIntegrationTests(unittest.TestCase):
+    def test_yfb_keyword_locator_uses_member_route_and_native_highlight(self) -> None:
+        old = keyword_locator_url(
+            "yfb", "https://www.yfbzb.com/inviteBid/detail/20260911_630083453.html",
+            "630083453", "储能系统",
+        )
+        self.assertIn("qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/infoDetail/630083453/1/zhaobiao", old)
+        self.assertIn("searchKeyWord=%E5%82%A8%E8%83%BD%E7%B3%BB%E7%BB%9F", old)
+        current = keyword_locator_url(
+            "yfb", "https://qiye.qianlima.com/new_qd_yfbsite/#/infoCenter/infoDetail/1/2831/zhaobiao?fromPage=searchPage",
+            "1", "电池",
+        )
+        self.assertIn("/1/2831/zhaobiao?fromPage=searchPage&searchKeyWord=", current)
+
     def setUp(self) -> None:
         self.original_data_dir = settings.data_dir
         self.temp = tempfile.TemporaryDirectory()
@@ -150,6 +163,58 @@ class StabilityIntegrationTests(unittest.TestCase):
         self.assertEqual(unsearched_recovery["category_counts"]["all"], normal_counts["all"])
         self.assertEqual(unsearched_recovery["category_counts"]["pending"], normal_counts["pending"])
         self.assertEqual(unsearched_recovery["category_counts"]["focus"], normal_counts["focus"])
+
+    def test_collection_warning_without_bad_attachment_is_not_a_parse_issue(self) -> None:
+        with get_db() as connection:
+            notice_id = ingest_notice_data(
+                connection, 1,
+                NoticeData(
+                    "warning-only", "会员内容受限公告", "https://example.com/warning-only", "公开正文",
+                    collection_warning="部分正文受会员权限限制",
+                ),
+                source_type="file_import", download_attachments=False,
+            )
+        issues = list_notices(only_issues=True, limit=100, offset=0)
+        self.assertNotIn(str(notice_id), {item["id"] for item in issues["items"]})
+
+    def test_today_new_uses_ingest_time_not_publication_time(self) -> None:
+        with get_db() as connection:
+            today_id = ingest_notice_data(connection, 1, NoticeData("today-new", "今日入库旧发布时间公告", "https://example.com/today-new", "正文"), source_type="file_import", download_attachments=False)
+            old_id = ingest_notice_data(connection, 1, NoticeData("old-new", "昨日入库公告", "https://example.com/old-new", "正文"), source_type="file_import", download_attachments=False)
+            connection.execute("UPDATE notices SET created_at='2026-09-10T15:00:00+00:00' WHERE id=?", (old_id,))
+        result = list_notices(only_today_new=True, only_matched=False, limit=10, offset=0)
+        self.assertIn(str(today_id), {item["id"] for item in result["items"]})
+        self.assertNotIn(str(old_id), {item["id"] for item in result["items"]})
+
+    def test_generic_tender_template_is_ignored_without_running_word(self) -> None:
+        path = settings.temp_dir / "template.doc"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"legacy word placeholder")
+        with get_db() as connection:
+            notice_id = ingest_notice_data(
+                connection, 1, NoticeData("template-ignore", "模板测试公告", "https://example.com/template", "正文"),
+                download_attachments=False,
+            )
+            attachment_id = create_attachment(connection, notice_id, "电科院项目-招文修改建议.doc", None, "stored")
+            with patch("backend.service.parse_document") as parser:
+                process_local_attachment(connection, notice_id, attachment_id, path, "文件编制模板/电科院项目-招文修改建议.doc")
+            parser.assert_not_called()
+            row = connection.execute("SELECT status,parse_status,error_message FROM attachments WHERE id=?", (attachment_id,)).fetchone()
+            self.assertEqual(tuple(row), ("stored", "ignored", None))
+
+    def test_ocr_runs_only_when_explicitly_enabled(self) -> None:
+        from backend.parsers import parse_pdf
+        path = settings.temp_dir / "scan.pdf"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import fitz
+        document = fitz.open()
+        document.new_page()
+        document.save(path)
+        document.close()
+        with patch("backend.ocr.parse_scanned_pdf", return_value=DocumentResult(text="OCR文字", parser="ppocr-v6-small", status="parsed")) as ocr:
+            self.assertEqual(parse_pdf(path).status, "ocr_pending")
+            self.assertEqual(parse_pdf(path, enable_ocr=True).text, "OCR文字")
+            ocr.assert_called_once_with(path)
 
     def test_recycle_bin_lists_deleted_notice_and_crawl_cannot_restore_it(self) -> None:
         with get_db() as connection:

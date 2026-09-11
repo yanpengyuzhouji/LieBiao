@@ -145,7 +145,7 @@ class ManualVerificationTests(unittest.TestCase):
             with get_db() as connection:
                 site_id = connection.execute("SELECT id FROM sites WHERE code='yfb'").fetchone()[0]
             adapter = unittest.mock.Mock()
-            adapter.health_check.return_value = {'ok': True, 'message': '企业公告列表正常'}
+            adapter.health_check.return_value = {'ok': True, 'mode': 'member', 'message': '会员采集正常'}
             credential = 'Admin-Token=test; __scout_browser_port=43210'
             with patch('backend.main.complete_verification', return_value=credential), \
                     patch('backend.main.make_adapter', return_value=adapter), \
@@ -154,6 +154,51 @@ class ManualVerificationTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200, response.text)
             self.assertIn('请保持窗口打开', response.json()['message'])
             closer.assert_not_called()
+
+    def test_yfb_browser_storage_login_does_not_require_cookie(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(settings, 'data_dir', Path(folder)):
+            init_db()
+            with get_db() as connection:
+                site_id = connection.execute("SELECT id FROM sites WHERE code='yfb'").fetchone()[0]
+                connection.execute(
+                    "INSERT INTO site_accounts(site_id,alias,credential_ref,session_status,enabled,created_at) "
+                    "VALUES(?, '人工验证会话', '__scout_browser_port=43210', 'needs_manual', 0, '2026-09-11')",
+                    (site_id,),
+                )
+            adapter = unittest.mock.Mock()
+            adapter.health_check.return_value = {'ok': True, 'mode': 'member', 'message': '会员采集正常'}
+            with patch('backend.main.complete_verification') as capture, \
+                    patch('backend.main.make_adapter', return_value=adapter) as factory, \
+                    patch('backend.main.close_verification') as closer:
+                response = TestClient(app).post(f'/api/sites/{site_id}/manual-verification/complete')
+            self.assertEqual(response.status_code, 200, response.text)
+            capture.assert_not_called()
+            credential = factory.call_args.kwargs['session_cookie']
+            self.assertIn('__scout_browser_port=43210', credential)
+            self.assertIn(f'__scout_browser_session={site_id}', credential)
+            closer.assert_not_called()
+
+    def test_yfb_non_member_switches_to_public_and_closes_browser(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(settings, 'data_dir', Path(folder)):
+            init_db()
+            with get_db() as connection:
+                site_id = connection.execute("SELECT id FROM sites WHERE code='yfb'").fetchone()[0]
+            adapter = unittest.mock.Mock()
+            adapter.health_check.return_value = {'ok': True, 'mode': 'public', 'message': '公开采集正常'}
+            with patch('backend.main.complete_verification', return_value='session=test'), \
+                    patch('backend.main.make_adapter', return_value=adapter), \
+                    patch('backend.main.close_verification') as closer:
+                response = TestClient(app).post(f'/api/sites/{site_id}/manual-verification/complete')
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()['mode'], 'public')
+            closer.assert_called_once_with(site_id)
+            with get_db() as connection:
+                account = connection.execute(
+                    "SELECT session_status,enabled FROM site_accounts WHERE site_id=? AND alias='人工验证会话'",
+                    (site_id,),
+                ).fetchone()
+            self.assertEqual(account['session_status'], 'public')
+            self.assertEqual(account['enabled'], 0)
 
     def test_chdtp_success_keeps_browser_for_scheduled_collection(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(settings, 'data_dir', Path(folder)):

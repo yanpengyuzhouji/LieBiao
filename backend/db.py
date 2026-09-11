@@ -328,6 +328,16 @@ def init_db() -> None:
                 (timestamp, timestamp),
             )
             connection.execute("INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,?)", ("migration.unmatched_crawl.v1", "1", timestamp))
+        # 通用投标模板和平台操作指引不包含项目技术信息，不应制造解析异常。
+        connection.execute(
+            "UPDATE attachments SET status='stored',parse_status='ignored',error_message=NULL "
+            "WHERE lower(name) LIKE '%招文修改建议%' "
+            "OR lower(name) LIKE '%异议书（模板）%' OR lower(name) LIKE '%异议书(模板)%' "
+            "OR lower(name) LIKE '%投诉书函（模板）%' OR lower(name) LIKE '%投诉书函(模板)%' "
+            "OR lower(name) LIKE '%招标人声明（适用于%' OR lower(name) LIKE '%招标人声明(适用于%' "
+            "OR lower(name) LIKE '%供应商操作指引%' "
+            "OR lower(name) LIKE '%投标人部分）%' OR lower(name) LIKE '%投标人部分)%'"
+        )
         seed_base_data(connection)
 
 
